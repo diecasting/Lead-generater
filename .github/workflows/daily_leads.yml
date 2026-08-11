@@ -2,15 +2,26 @@ name: Daily Leads Collection
 
 on:
   schedule:
-    # 北京时间每天 08:00 = UTC 00:00（GitHub Actions 使用 UTC）
-    - cron: '0 0 * * *'
-  # 允许在 Actions 页面手动触发，便于调试
-  workflow_dispatch:
+    - cron: '0 0 * * *'  # 每天 UTC 0点（北京时间早8点）运行
+  workflow_dispatch:      # 允许手动触发
 
 jobs:
   collect-leads:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+
+    # 关键：在 job 级别定义全局环境变量，该 job 下所有 step 都能直接读取到 Secrets
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      MAIL_SERVER: ${{ secrets.MAIL_SERVER }}
+      MAIL_PORT: ${{ secrets.MAIL_PORT }}
+      MAIL_USERNAME: ${{ secrets.MAIL_USERNAME }}
+      MAIL_PASSWORD: ${{ secrets.MAIL_PASSWORD }}
+      MAIL_RECIPIENT: ${{ secrets.MAIL_RECIPIENT }}
+      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+      OPENAI_MODEL: ${{ secrets.OPENAI_MODEL }}
+      BING_API_KEY: ${{ secrets.BING_API_KEY }}
+      MAIL_SENDER: ${{ secrets.MAIL_SENDER }}
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -18,47 +29,21 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.10'
+          cache: 'pip'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      # 安全调试：只打印“哪些 secret 已设置”，绝不打印其值，避免泄露凭据
-      - name: Debug — which secrets are set (names only)
-        env:
-          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL:    ${{ secrets.OPENAI_MODEL }}
-          BING_API_KEY:    ${{ secrets.BING_API_KEY }}
-          MAIL_SERVER:     ${{ secrets.MAIL_SERVER }}
-          MAIL_PORT:       ${{ secrets.MAIL_PORT }}
-          MAIL_USERNAME:   ${{ secrets.MAIL_USERNAME }}
-          MAIL_PASSWORD:   ${{ secrets.MAIL_PASSWORD }}
-          MAIL_RECIPIENT:  ${{ secrets.MAIL_RECIPIENT }}
-          MAIL_SENDER:     ${{ secrets.MAIL_SENDER }}
-        run: python -c "import os; ks=['OPENAI_API_KEY','OPENAI_BASE_URL','OPENAI_MODEL','BING_API_KEY','MAIL_SERVER','MAIL_PORT','MAIL_USERNAME','MAIL_PASSWORD','MAIL_RECIPIENT','MAIL_SENDER']; print('SET:', [k for k in ks if os.getenv(k)]); print('MISSING:', [k for k in ks if not os.getenv(k)])"
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
       - name: Run lead collector
         run: python main.py
-        env:
-          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
-          OPENAI_MODEL:    ${{ secrets.OPENAI_MODEL }}
-          BING_API_KEY:    ${{ secrets.BING_API_KEY }}
-          MAIL_SERVER:     ${{ secrets.MAIL_SERVER }}
-          MAIL_PORT:       ${{ secrets.MAIL_PORT }}
-          MAIL_USERNAME:   ${{ secrets.MAIL_USERNAME }}
-          MAIL_PASSWORD:   ${{ secrets.MAIL_PASSWORD }}
-          MAIL_RECIPIENT:  ${{ secrets.MAIL_RECIPIENT }}
-          MAIL_SENDER:     ${{ secrets.MAIL_SENDER }}
 
-      # 无论成功失败都保留当日报告，方便排查
       - name: Upload report artifact
-        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: leads-report
           path: |
             leads_report.html
             leads_report.json
-          retention-days: 30
