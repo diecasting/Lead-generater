@@ -17,6 +17,7 @@ Daily Lead Collector — CNC / Die Casting / Casting / Plastic Injection Molding
 """
 
 import os
+import re
 import json
 import sys
 import ssl
@@ -248,19 +249,117 @@ SYSTEM_PROMPT = (
 )
 
 
-def clean_with_ai(raw_results):
-    api_key = cfg("OPENAI_API_KEY")
-    if not api_key or OpenAI is None:
-        print("[ai] OPENAI_API_KEY 缺失或 openai 未安装；跳过 AI 过滤，"
-              "回退为原始结果直通。", file=sys.stderr)
-        return [{
-            "company": "Unknown",
-            "need_summary": (r.get("snippet") or "")[:200],
-            "source_url": r.get("url", ""),
-            "keyword": r.get("keyword", ""),
-            "confidence": "low",
-        } for r in raw_results[:RESULTS_LIMIT]]
+# ---------------------------------------------------------------------------
+# 规则清洗（确定性、零依赖；OpenAI 额度不足 / 网络不通时自动回退）
+# ---------------------------------------------------------------------------
+# 购买意图信号（强）
+BUY_SIGNALS = [
+    (r"\brfq\b|request for quote", 4),
+    (r"inquir|enquir", 3),
+    (r"\bbuyer\b", 3),
+    (r"sourc", 2),
+    (r"quot", 2),
+    (r"purchas|procure", 2),
+    (r"looking for|\bneed\b|required|requirement|\bwant\b", 2),
+]
+# 行业相关性（加分但不代表购买意图）
+DOMAIN_SIGNALS = [
+    (r"custom|customiz", 1),
+    (r"supplier|manufacturer|factory", 1),
+    (r"casting|die[- ]?cast|\bcnc\b|machin|mold|mould|injection", 1),
+]
+# 供应商自广告（减分）
+AD_SIGNALS = [
+    (r"we (are|provide|offer|supply)\b", 1),
+    (r"leading (supplier|manufacturer)", 1),
+    (r"our company|contact us|get a quote", 1),
+]
+# 纯噪声（新闻 / 教程 / 招聘）
+NOISE_SIGNALS = [
+    (r"news|article|tutorial|how[- ]to|wiki|definition", 2),
+    (r"job|salary|career|hiring|vacancy", 2),
+]
+# 来自「RFQ / 询价类」搜索关键词的天然购买意图，给基础分
+KW_BUY_BONUS = 2
+KW_BUY_RE = re.compile(r"rfq|inquir|buyer|sourc|request for quote", re.I)
+RULE_MIN_SCORE = 3
 
+
+def _company_from_result(r):
+    """最佳努力从 URL 域名或标题推导公司 / 来源名（不依赖外部 API）。"""
+    url = r.get("url", "") or ""
+    title = (r.get("title") or "").strip()
+    domain = ""
+    try:
+        netloc = urlparse(url).netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        domain = netloc.split(".")[0]
+    except Exception:
+        pass
+    # 标题不像句子开头（how/what/why/the）时，用标题作公司线索更准确
+    if title and not title.lower().startswith(("how", "what", "why", "the ")):
+        return title[:50]
+    if domain:
+        return domain.capitalize()
+    return "Unknown"
+
+
+def clean_with_rules(raw_results):
+    """基于 Python 内置规则的确定性清洗（无需任何 API）。
+
+    按购买意图关键词加权打分，过滤掉新闻 / 教程 / 供应商自广告等噪声，
+    即使没有 OpenAI 额度，也能稳定产出合格线索。
+    """
+    seen = set()
+    scored = []
+    for r in raw_results:
+        url = r.get("url", "")
+        if not url or url in seen:
+            continue
+        seen.add(url)
+
+        blob = f"{r.get('title','')} {r.get('snippet','')} {r.get('keyword','')}".lower()
+
+        def _sum(patterns):
+            return sum(w for pat, w in patterns if re.search(pat, blob))
+
+        buy = _sum(BUY_SIGNALS)
+        ad = _sum(AD_SIGNALS)
+        noise = _sum(NOISE_SIGNALS)
+        # 搜索关键词本身含购买意图时加基础分（搜索已定向到买家）
+        kw_bonus = KW_BUY_BONUS if KW_BUY_RE.search(r.get("keyword", "")) else 0
+        score = buy + _sum(DOMAIN_SIGNALS) + kw_bonus - ad - noise
+
+        # 判定合格：有购买意图、非供应商自广告、非纯噪声
+        if buy >= 2 and ad < 2 and noise == 0 and score >= RULE_MIN_SCORE:
+            conf = "high" if score >= 8 else ("medium" if score >= 5 else "low")
+            scored.append({
+                "company": _company_from_result(r),
+                "need_summary": (r.get("snippet") or r.get("title") or "")[:160],
+                "source_url": url,
+                "keyword": r.get("keyword", ""),
+                "confidence": conf,
+                "_score": score,
+            })
+
+    scored.sort(key=lambda x: x["_score"], reverse=True)
+    for s in scored:
+        s.pop("_score", None)
+    return scored[:RESULTS_LIMIT]
+
+
+def clean_with_ai(raw_results):
+    """优先用大模型清洗；任何失败（缺密钥 / 429 额度不足 / 网络错误）自动回退规则清洗。"""
+    api_key = cfg("OPENAI_API_KEY")
+
+    # 1) 完全没配置密钥或 SDK 不可用 -> 直接走规则清洗
+    if not api_key or OpenAI is None:
+        print("[ai] 未配置 OPENAI_API_KEY 或 openai 未安装；"
+              "回退到基于规则的本地清洗。", file=sys.stderr)
+        return clean_with_rules(raw_results)
+
+    # 2) 调用 OpenAI 兼容端点（base_url / model 均可通过环境变量切换）
     client = OpenAI(
         api_key=api_key,
         base_url=cfg("OPENAI_BASE_URL") or None,   # 兼容 Azure / OpenRouter 等
@@ -281,10 +380,19 @@ def clean_with_ai(raw_results):
         content = resp.choices[0].message.content or "{}"
         data = json.loads(content)
         leads = data.get("leads", [])
+        if not leads:
+            print("[ai] 大模型未返回任何合格线索；回退到基于规则的本地清洗。",
+                  file=sys.stderr)
+            return clean_with_rules(raw_results)
+        return leads[:RESULTS_LIMIT]
     except Exception as e:
-        print(f"[ai] cleaning failed: {e}", file=sys.stderr)
-        return []
-    return leads[:RESULTS_LIMIT]
+        # 429 额度不足 / 网络不通 / 超时 等任意异常 -> 启用规则回退，不让当天线索丢失
+        reason = type(e).__name__
+        if getattr(e, "status", None) == 429 or "insufficient" in str(e).lower():
+            reason = "429 insufficient_quota"
+        print(f"[ai] 大模型清洗调用失败 ({reason})；"
+              "回退到基于规则的本地清洗，确保今日线索不丢失。", file=sys.stderr)
+        return clean_with_rules(raw_results)
 
 
 # ---------------------------------------------------------------------------
