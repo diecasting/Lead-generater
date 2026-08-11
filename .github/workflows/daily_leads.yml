@@ -23,6 +23,21 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # 安全调试：只打印“哪些 secret 已设置”，绝不打印其值，避免泄露凭据
+      - name: Debug — which secrets are set (names only)
+        env:
+          OPENAI_API_KEY:  ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL:    ${{ secrets.OPENAI_MODEL }}
+          BING_API_KEY:    ${{ secrets.BING_API_KEY }}
+          MAIL_SERVER:     ${{ secrets.MAIL_SERVER }}
+          MAIL_PORT:       ${{ secrets.MAIL_PORT }}
+          MAIL_USERNAME:   ${{ secrets.MAIL_USERNAME }}
+          MAIL_PASSWORD:   ${{ secrets.MAIL_PASSWORD }}
+          MAIL_RECIPIENT:  ${{ secrets.MAIL_RECIPIENT }}
+          MAIL_SENDER:     ${{ secrets.MAIL_SENDER }}
+        run: python -c "import os; ks=['OPENAI_API_KEY','OPENAI_BASE_URL','OPENAI_MODEL','BING_API_KEY','MAIL_SERVER','MAIL_PORT','MAIL_USERNAME','MAIL_PASSWORD','MAIL_RECIPIENT','MAIL_SENDER']; print('SET:', [k for k in ks if os.getenv(k)]); print('MISSING:', [k for k in ks if not os.getenv(k)])"
+
       - name: Run lead collector
         run: python main.py
         env:
