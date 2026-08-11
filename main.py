@@ -10,10 +10,14 @@ Daily Lead Collector — CNC / Die Casting / Casting / Plastic Injection Molding
 
 流程：
   1. 多关键词搜索（Bing Web Search API，未配置 Key 时回退到 DuckDuckGo 公开搜索）
+     —— 关键词采用分类矩阵（压铸/模具、CNC/精密加工、外贸/代工买家），
+        支持 SEARCH_COMBINE 组合长尾查询，单次覆盖更多维度与原始线索
   2. 优先调用大模型 API 清洗、过滤垃圾信息；遇 429 / 超时 / 无额度时自动
      指数退避重试，并回退到本地规则清洗，确保不丢线索
-  3. 生成美观、响应式的 HTML 日报（含意向评级、可点击来源），通过 SMTP
-     (SSL / STARTTLS) 发送；并按 sent_cache.json 历史去重，避免重复推送
+  3. 网页邮箱提取：对每条线索的来源页面用正则抓取并过滤真实联系邮箱
+     （过滤静态资源后缀、example.com 占位、no-reply 等垃圾邮箱）
+  4. 生成美观、响应式的 HTML 日报（含意向评级、可点击来源、✉️ 邮箱），
+     通过 SMTP (SSL / STARTTLS) 发送；并按 sent_cache.json 历史去重，避免重复推送
 
 所有敏感配置均来自环境变量 / GitHub Secrets，不写死在代码中。
 """
@@ -44,18 +48,78 @@ except ImportError:
 # 配置（全部来自环境变量 / GitHub Secrets）
 # ---------------------------------------------------------------------------
 
-# 目标行业关键词，可自行增减
-KEYWORDS = [
-    "CNC machining RFQ",
-    "aluminum die casting inquiry",
-    "plastic mold RFQ",
-    "custom casting buyer",
-    "plastic injection molding parts sourcing",
-    "die casting buyer request for quote",
+# 目标行业关键词矩阵（分门别类，可自行增减）。单次运行会遍历全部关键词，
+# 大幅提升覆盖维度与原始线索数量。
+KEYWORD_GROUPS = {
+    "压铸与模具类": [
+        "aluminum die casting RFQ",
+        "zinc die casting supplier inquiry",
+        "custom plastic mold RFQ",
+        "injection molding buyer request",
+        "die casting parts buyer",
+        "die casting tooling RFQ",
+        "magnesium die casting inquiry",
+        "plastic injection mold maker wanted",
+        "mold maker RFQ China",
+        "die casting company looking for supplier",
+    ],
+    "CNC与精密加工类": [
+        "CNC machining parts RFQ",
+        "precision machining buyer inquiry",
+        "custom metal fabrication sourcing",
+        "OEM CNC milling RFQ",
+        "5 axis CNC machining RFQ",
+        "CNC turning parts buyer",
+        "machined aluminum parts inquiry",
+        "precision components sourcing agent",
+        "CNC machining contract manufacturer",
+        "rapid prototyping machining RFQ",
+    ],
+    "外贸与代工买家类": [
+        "looking for manufacturing factory China",
+        "contract manufacturing RFQ",
+        "metal parts sourcing agent buyer",
+        "OEM ODM supplier inquiry",
+        "outsource manufacturing RFQ",
+        "find supplier for metal parts",
+        "manufacturing partner wanted",
+        "buyer seeking factory CNC",
+        "import metal components inquiry",
+        "distributor looking for manufacturer",
+    ],
+}
+
+# 组合搜索：将「工艺词」与「采购意图词」交叉，生成更多长尾查询
+# （默认关闭，通过 SEARCH_COMBINE=1 开启；组合数量受 SEARCH_COMBINE_MAX 限制）
+COMBINE_PROCESS = [
+    "aluminum die casting", "zinc die casting", "CNC machining",
+    "plastic injection molding", "precision machining", "metal stamping",
+]
+COMBINE_INTENT = [
+    "RFQ", "buyer inquiry", "supplier wanted", "sourcing request",
+    "OEM ODM inquiry", "contract manufacturer wanted",
 ]
 
+
+def get_search_keywords():
+    """返回本次运行要检索的关键词列表（分类展开 + 可选组合），去重保序。"""
+    kws = []
+    for group in KEYWORD_GROUPS.values():
+        kws.extend(group)
+    if str(os.getenv("SEARCH_COMBINE", "")).lower() in ("1", "true", "yes"):
+        combos = [f"{p} {i}" for p in COMBINE_PROCESS for i in COMBINE_INTENT]
+        maxc = int(os.getenv("SEARCH_COMBINE_MAX", "8"))
+        kws.extend(combos[:maxc])
+    seen, out = set(), []
+    for k in kws:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
 SEARCH_PER_KEYWORD = int(os.getenv("SEARCH_PER_KEYWORD", "10"))
-RESULTS_LIMIT = int(os.getenv("LEADS_LIMIT", "15"))
+RESULTS_LIMIT = int(os.getenv("LEADS_LIMIT", "20"))
 
 # AI 容灾：指数退避重试（应对 429 / 超时 / 网络抖动）
 MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "2"))
@@ -222,8 +286,10 @@ def ddg_search(query, count=SEARCH_PER_KEYWORD):
 
 def collect_raw_leads():
     bing_key = cfg("BING_API_KEY")
+    keywords = get_search_keywords()
+    print(f"[search] 共 {len(keywords)} 个检索关键词。")
     results = []
-    for kw in KEYWORDS:
+    for kw in keywords:
         print(f"[search] '{kw}'")
         try:
             if bing_key:
@@ -435,6 +501,122 @@ def clean_with_ai(raw_results):
 
 
 # ---------------------------------------------------------------------------
+# 网页邮箱提取（Regex 轻量抓取 + 灰名单过滤）
+# ---------------------------------------------------------------------------
+EMAIL_RE = re.compile(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+")
+# 静态资源后缀 -> 形如 image@x.png 的伪邮箱
+EMAIL_STATIC_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".css", ".js",
+                     ".svg", ".webp", ".ico", ".pdf")
+# 占位 / 示例域名
+EMAIL_JUNK_DOMAINS = ("example.com", "example.org", "example.net",
+                       "test.com", "localhost", "w3.org")
+# 系统 / 无回复邮箱（通常不可作为跟进线索）
+EMAIL_NOREPLY_LOCAL = ("noreply", "no-reply", "donotreply", "do-not-reply",
+                       "mailer-daemon", "postmaster")
+
+
+def _is_real_email(email):
+    """判断一个字符串是否为可跟进的真实邮箱（过滤占位/静态资源/无回复）。"""
+    e = (email or "").strip().lower()
+    if "@" not in e:
+        return False
+    local, _, domain = e.rpartition("@")
+    if not local or not domain:
+        return False
+    if domain in EMAIL_JUNK_DOMAINS:
+        return False
+    if any(e.endswith(ext) for ext in EMAIL_STATIC_EXTS):
+        return False
+    if local in EMAIL_NOREPLY_LOCAL:
+        return False
+    return True
+
+
+def extract_emails_from_text(text):
+    """从纯文本中用正则提取邮箱，去重并过滤垃圾邮箱。"""
+    if not text:
+        return []
+    out = []
+    for raw in EMAIL_RE.findall(text):
+        e = raw.strip(".,;<>()[]'\" ")
+        if _is_real_email(e) and e not in out:
+            out.append(e)
+    return out
+
+
+def extract_emails_from_html(html):
+    """从 HTML 中提取邮箱：同时扫描可见正文与 mailto: 链接。"""
+    emails = set()
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        emails.update(extract_emails_from_text(soup.get_text(" ", strip=True)))
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if href.lower().startswith("mailto:"):
+                addr = href[7:].split("?")[0].split(",")
+                for part in addr:
+                    part = part.strip()
+                    if _is_real_email(part):
+                        emails.add(part)
+    except Exception as e:
+        print(f"[email] HTML 解析失败：{e}", file=sys.stderr)
+    return sorted(emails)
+
+
+def fetch_page_text(url, timeout=8, max_bytes=500_000):
+    """轻量抓取网页正文（限制体积，避免大文件拖慢运行）。失败返回 None。"""
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml",
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        resp.raise_for_status()
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if "html" not in ctype and "text" not in ctype:
+            return None
+        data = b""
+        for chunk in resp.iter_content(8192):
+            data += chunk
+            if len(data) >= max_bytes:
+                break
+        enc = resp.encoding or "utf-8"
+        return data.decode(enc, errors="ignore")
+    except Exception as e:
+        print(f"[email] 抓取失败 {url}: {e}", file=sys.stderr)
+        return None
+
+
+def enrich_leads_with_emails(leads):
+    """为每条线索补充提取到的邮箱（来自摘要文本 + 网页抓取），不阻断主流程。
+
+    - 即使无网络 / 抓取失败，也会从摘要文本中尽力提取邮箱
+    - 网页抓取受 EMAIL_MAX_FETCH / EMAIL_FETCH_TIMEOUT 限制，单条失败不影响其它线索
+    """
+    enabled = str(os.getenv("EMAIL_EXTRACTION", "1")).lower() in ("1", "true", "yes")
+    timeout = int(os.getenv("EMAIL_FETCH_TIMEOUT", "8"))
+    max_fetch = int(os.getenv("EMAIL_MAX_FETCH", "20"))
+    if not enabled:
+        print("[email] 网页抓取已关闭（EMAIL_EXTRACTION != 1），"
+              "仅从摘要文本提取。", file=sys.stderr)
+    fetched = 0
+    for l in leads:
+        found = set(extract_emails_from_text(l.get("need_summary", "") or ""))
+        url = l.get("source_url")
+        if enabled and url and fetched < max_fetch:
+            html = fetch_page_text(url, timeout=timeout)
+            if html:
+                found.update(extract_emails_from_html(html))
+            fetched += 1
+            if found:
+                print(f"[email] {url} -> {len(found)} 个邮箱", file=sys.stderr)
+        l["emails"] = sorted(found)[:5]
+    return leads
+
+
+# ---------------------------------------------------------------------------
 # 报告渲染
 # ---------------------------------------------------------------------------
 
@@ -459,6 +641,15 @@ def build_html_report(leads, generated_at):
             url = l.get("source_url", "") or "#"
             company = esc(l.get("company", "Unknown"))
             summary = esc(l.get("need_summary", "")) or "（无摘要）"
+            emails = l.get("emails") or []
+            if emails:
+                email_links = " · ".join(
+                    f'<a class="email" href="mailto:{esc(e)}">{esc(e)}</a>'
+                    for e in emails[:3]
+                )
+                email_block = f'<p class="lead-email">✉️ 邮箱: {email_links}</p>'
+            else:
+                email_block = '<p class="lead-email none">✉️ 邮箱: 未公开</p>'
             cards.append(f"""
             <div class="lead">
               <div class="lead-top">
@@ -468,6 +659,7 @@ def build_html_report(leads, generated_at):
               </div>
               <a class="lead-title" href="{esc(url)}" target="_blank" rel="noopener">{company}</a>
               <p class="lead-summary">{summary}</p>
+              {email_block}
               <a class="lead-link" href="{esc(url)}" target="_blank" rel="noopener">查看原始来源 ↗</a>
             </div>""")
         body = "".join(cards)
@@ -497,6 +689,10 @@ def build_html_report(leads, generated_at):
   .lead-summary {{ margin:8px 0 10px; font-size:14px; line-height:1.6; color:#415062; }}
   .lead-link {{ display:inline-block; font-size:13px; color:#1e88e5; text-decoration:none; font-weight:600; }}
   .lead-link:hover {{ text-decoration:underline; }}
+  .lead-email {{ margin:0 0 10px; font-size:13px; color:#415062; word-break:break-all; }}
+  .lead-email .email {{ color:#c0392b; text-decoration:none; font-weight:600; }}
+  .lead-email .email:hover {{ text-decoration:underline; }}
+  .lead-email.none {{ color:#9aa7b4; font-style:italic; }}
   .empty {{ color:#7a8794; padding:14px 0; line-height:1.6; }}
   .footer {{ text-align:center; color:#9aa7b4; font-size:12px; margin-top:18px; line-height:1.6; }}
   @media (max-width:480px) {{
@@ -657,6 +853,11 @@ def main():
     history = load_sent_history()
     leads = dedupe_leads(leads, history)
     print(f"==> 去重后剩余 {len(leads)} 条新线索待推送。")
+
+    # 网页邮箱提取：为每条线索抓取并解析其来源页面中的联系邮箱
+    leads = enrich_leads_with_emails(leads)
+    total_emails = sum(len(l.get("emails") or []) for l in leads)
+    print(f"==> 邮箱提取完成：共从 {len(leads)} 条线索中解析到 {total_emails} 个邮箱。")
 
     html = build_html_report(leads, generated_at)
 
