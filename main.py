@@ -11,7 +11,7 @@ Daily Lead Collector — CNC / Die Casting / Casting / Plastic Injection Molding
 流程：
   1. 多关键词搜索（Bing Web Search API，未配置 Key 时回退到 DuckDuckGo 公开搜索）
   2. 调用大模型 API 清洗、过滤垃圾信息，抽取结构化线索
-  3. 生成美观的 HTML 日报，通过 SMTP (SSL) 发送至指定邮箱
+  3. 生成美观的 HTML 日报，通过 SMTP (SSL / STARTTLS) 发送至指定邮箱
 
 所有敏感配置均来自环境变量 / GitHub Secrets，不写死在代码中。
 """
@@ -21,6 +21,7 @@ import json
 import sys
 import ssl
 import smtplib
+import socket
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -318,12 +319,46 @@ def send_email(subject, html):
     msg["To"] = recipient
     msg.attach(MIMEText(html, "html", "utf-8"))
 
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL(server, port, context=context, timeout=30) as s:
-        s.login(username, password)
-        s.send_message(msg)
-    print(f"[mail] 日报已发送至 {recipient}")
-    return True
+    # 端口 465 使用隐式 SSL；其它端口（如 587）使用 STARTTLS 显式加密升级。
+    # SiteGround 企业邮（sgp14.siteground.asia）推荐用 587 + STARTTLS。
+    use_ssl = (port == 465)
+    timeout = 30
+
+    try:
+        if use_ssl:
+            context = ssl.create_default_context()
+            with smtplib.SMTP_SSL(server, port, context=context, timeout=timeout) as s:
+                s.login(username, password)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(server, port, timeout=timeout) as s:
+                s.ehlo()
+                s.starttls(context=ssl.create_default_context())  # 加密升级
+                s.ehlo()
+                s.login(username, password)
+                s.send_message(msg)
+        print(f"[mail] 日报已发送至 {recipient}")
+        return True
+
+    except smtplib.SMTPAuthenticationError as e:
+        print(f"[mail][ERROR] SMTP 认证失败 (SMTPAuthenticationError)："
+              f"用户名或密码/授权码错误。详情: {e}", file=sys.stderr)
+    except smtplib.SMTPConnectError as e:
+        print(f"[mail][ERROR] 无法连接 SMTP 服务器 (SMTPConnectError)："
+              f"地址或端口错误，或网络不通。详情: {e}", file=sys.stderr)
+    except smtplib.SMTPServerDisconnected as e:
+        print(f"[mail][ERROR] SMTP 服务器在通信过程中断开 (SMTPServerDisconnected)："
+              f"{e}", file=sys.stderr)
+    except smtplib.SMTPException as e:
+        print(f"[mail][ERROR] SMTP 协议错误 (SMTPException)：{e}", file=sys.stderr)
+    except socket.timeout:
+        print("[mail][ERROR] 连接超时 (socket.timeout)：SMTP 服务器响应过慢或网络受限，"
+              "请检查 MAIL_SERVER / MAIL_PORT。", file=sys.stderr)
+    except OSError as e:
+        print(f"[mail][ERROR] 网络/系统底层错误 (OSError)：{e}", file=sys.stderr)
+    except Exception as e:  # noqa: BLE001
+        print(f"[mail][ERROR] 发送邮件时发生未知错误：{e!r}", file=sys.stderr)
+    return False
 
 
 # ---------------------------------------------------------------------------
