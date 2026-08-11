@@ -21,8 +21,10 @@ GitHub Actions (每天 UTC 00:00 / 北京 08:00)
         │       抽取：客户/买家、需求摘要、来源网址、置信度
         │
         └─► 3. 邮件推送
-               生成 HTML 日报，经 SMTP (SSL) 发送至 Hank@alumcasting.com
+               生成 HTML 日报，经 SMTP (SSL 或 STARTTLS) 发送至 Hank@alumcasting.com
 ```
+
+> 说明：若 `OPENAI_API_KEY` 未配置、额度不足（429）或网络异常，系统会自动回退到**基于关键词规则的本地清洗**，当天线索不会丢失；同一来源的线索会按 `sent_cache.json` 历史去重，避免重复推送。
 
 ## 项目结构
 
@@ -30,9 +32,11 @@ GitHub Actions (每天 UTC 00:00 / 北京 08:00)
 .
 ├── .github/
 │   └── workflows/
-│       └── daily_leads.yml      # GitHub Actions 定时任务
+│       └── daily_leads.yml      # GitHub Actions 定时任务（每天 UTC 00:00 / 北京 08:00）
 ├── main.py                      # 核心执行脚本
 ├── requirements.txt             # Python 依赖
+├── tests/                       # pytest 单元测试（配置校验 / 规则清洗 / 容灾 / 邮箱提取 / 去重）
+├── sent_cache.json              # 已推送线索缓存（自动生成，已 gitignore，CI 中通过 cache 持久化）
 └── README.md                    # 本说明
 ```
 
@@ -71,17 +75,63 @@ python main.py
 | `MAIL_RECIPIENT` | ⬜ | 收件人，默认 `Hank@alumcasting.com` |
 | `MAIL_SENDER` | ⬜ | 发件人显示名对应的邮箱，默认等于 `MAIL_USERNAME` |
 
+> 兼容性说明：配置校验时 `MAIL_SERVER` 等价于 `MAIL_HOST`、`MAIL_USERNAME` 等价于 `MAIL_USER`，两套命名均可被识别，不影响运行。
+
 ### 关于邮箱密码的重要提示
 
 - **Gmail**：不能使用普通登录密码，需在 Google 账号 → 安全 → 开启两步验证 → 生成 **App Password（应用专用密码）**，填到 `MAIL_PASSWORD`。
-- **企业邮箱（如腾讯企业邮 / 阿里邮箱 / Outlook）**：填写对应的 SMTP 地址与授权码。常见地址：
+- **企业邮箱（如腾讯企业邮 / 阿里邮箱 / SiteGround / Outlook）**：填写对应的 SMTP 地址与授权码。常见地址：
   - 腾讯企业邮：`smtp.exmail.qq.com`，端口 `465`
-  - Outlook/Hotmail：`smtp.office365.com`，端口 `587`（此时需改用 STARTTLS，可联系维护者调整脚本）
+  - SiteGround 企业邮：`sgp14.siteground.asia`，端口 `587`（脚本已内置 STARTTLS 支持）
+  - Outlook/Hotmail：`smtp.office365.com`，端口 `587`（脚本已内置 STARTTLS 支持）
+- 端口 `465` 走隐式 SSL；端口 `587`（或任意非 465 端口）走 `STARTTLS` 加密升级，脚本会根据端口自动选择，无需手动改代码。
 - 若不配置任何 SMTP 凭据，脚本不会报错退出，而是仅把报告保存为本地产物，方便先验证搜索与 AI 流程。
 
 ## 自定义搜索关键词
 
-编辑 `main.py` 顶部的 `KEYWORDS` 列表即可增删目标行业关键词。每个关键词会分别发起一轮搜索。
+搜索关键词以分类矩阵 `KEYWORD_GROUPS`（位于 `main.py` 顶部）组织，分为「压铸与模具类」「CNC 与精密加工类」「外贸与代工买家类」三组，共 30 个长尾/采购意图词。编辑该字典即可增删关键词；每组内的关键词会分别发起一轮搜索。
+
+如需进一步扩大搜索量，可开启**组合搜索**（见下方「环境变量 / 配置项」中的 `SEARCH_COMBINE`）。
+
+## 环境变量 / 配置项（非敏感，可选）
+
+以下变量均为**非敏感配置**，可通过环境变量传入（本地运行时 `export`，或 GitHub Actions 的 `env:` / `vars`）。未设置时使用默认值，均可正常运行。
+
+| 变量名 | 默认值 | 说明 |
+|---|---|---|
+| `SEARCH_PER_KEYWORD` | `10` | 每个关键词搜索返回的结果条数上限 |
+| `SEARCH_COMBINE` | `0` | 是否开启组合搜索。`1` 时把「工艺词 × 意图词」交叉组合生成更多长尾查询（受 `SEARCH_COMBINE_MAX` 限制），扩大搜索覆盖；`0` 关闭 |
+| `SEARCH_COMBINE_MAX` | `8` | 组合搜索生成的最大查询数量（防止查询爆炸） |
+| `RESULTS_LIMIT` / `LEADS_LIMIT` | `20` | 每次运行最终收集并推送的线索数量上限（两名为同义，任一生效即可） |
+| `EMAIL_EXTRACTION` | `1` | 是否开启网页邮箱自动抓取。`0` 关闭（仅依赖搜索结果中的邮箱）；`1` 开启后会轻量抓取线索网页正文提取邮箱 |
+| `EMAIL_MAX_FETCH` | `5` | 单次运行最多抓取的网页数量（控制耗时与请求量） |
+| `EMAIL_FETCH_TIMEOUT` | `8` | 单条网页抓取的超时时间（秒） |
+| `AI_MAX_RETRIES` | `2` | 大模型调用遇到 429 / 网络错误时的最大重试次数 |
+| `AI_RETRY_BASE_DELAY` | `3` | 重试退避基准秒数，第 n 次重试等待 `base × 2^(n-1)`（即 3s → 6s） |
+| `OPENAI_BASE_URL` | 空（官方） | 兼容端点地址（Azure / OpenRouter / 本地 vLLM 等） |
+| `OPENAI_MODEL` | `gpt-4o-mini` | 使用的模型名 |
+| `HISTORY_FILE` | `sent_cache.json` | 已推送线索历史缓存文件路径 |
+| `HISTORY_MAX` | `2000` | 历史缓存保留的最大条目数（超出后从最早开始淘汰） |
+
+### 本地调试示例（含新增配置项）
+
+```bash
+pip install -r requirements.txt
+
+export OPENAI_API_KEY="sk-..."
+export MAIL_SERVER="sgp14.siteground.asia"
+export MAIL_PORT="587"
+export MAIL_USERNAME="you@your-domain.com"
+export MAIL_PASSWORD="your_mail_auth_code"
+export MAIL_RECIPIENT="Hank@alumcasting.com"
+
+# 可选：开启组合搜索 + 调整线索上限
+export SEARCH_COMBINE=1
+export RESULTS_LIMIT=25
+export EMAIL_EXTRACTION=1
+
+python main.py
+```
 
 ## 定时时间说明
 
