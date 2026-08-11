@@ -61,6 +61,75 @@ def cfg(name, default=None):
 
 
 # ---------------------------------------------------------------------------
+# 启动期配置校验（Phase 12.1 — 生产级配置校验器）
+# ---------------------------------------------------------------------------
+
+class ConfigError(Exception):
+    """启动配置校验失败。错误信息对人类可读，且绝不包含任何 secret 值。"""
+
+
+# 邮件配置支持新规范名 (MAIL_HOST / MAIL_USER) 与旧名 (MAIL_SERVER / MAIL_USERNAME) 兼容，
+# 这样已部署的工作流（使用 MAIL_SERVER / MAIL_USERNAME）无需改动即可继续工作。
+MAIL_HOST_ALIASES = ["MAIL_HOST", "MAIL_SERVER"]
+MAIL_USER_ALIASES = ["MAIL_USER", "MAIL_USERNAME"]
+
+
+def _first_set(aliases, default=None):
+    """按顺序返回第一个非空的环境变量；都为空时返回 default。"""
+    for name in aliases:
+        val = os.getenv(name)
+        if val:
+            return val
+    return default
+
+
+def validate_config():
+    """在任务启动前校验关键环境变量。
+
+    - 缺失 / 无效的必填项 -> 抛出 ConfigError（信息可读，且不泄露任何 secret 值）
+    - OPENAI_API_KEY 可选；缺失时仅打印警告，不阻断运行
+    """
+    errors = []
+    warnings = []
+
+    if not _first_set(MAIL_HOST_ALIASES):
+        errors.append("MAIL_HOST (或兼容别名 MAIL_SERVER) 未设置 — 邮件服务器地址缺失")
+
+    port_raw = os.getenv("MAIL_PORT")
+    if not port_raw:
+        errors.append("MAIL_PORT 未设置")
+    else:
+        try:
+            int(port_raw)
+        except (TypeError, ValueError):
+            # 只报告变量名，不打印变量值，避免泄露配置
+            errors.append("MAIL_PORT 必须是合法整数（当前值无法解析为整数）")
+
+    if not _first_set(MAIL_USER_ALIASES):
+        errors.append("MAIL_USER (或兼容别名 MAIL_USERNAME) 未设置 — 邮件登录账户缺失")
+
+    if not os.getenv("MAIL_PASSWORD"):
+        errors.append("MAIL_PASSWORD 未设置 — 邮件授权码/密码缺失")
+
+    if not os.getenv("OPENAI_API_KEY"):
+        warnings.append(
+            "OPENAI_API_KEY 未设置：AI 清洗将被跳过，回退为原始结果直通（任务仍会运行）"
+        )
+
+    if errors:
+        lines = [
+            "[config] 启动配置校验失败，已中止运行。请检查 GitHub Secrets / 环境变量：",
+            *[f"  ✗ {e}" for e in errors],
+        ]
+        if warnings:
+            lines += [f"  ! {w}" for w in warnings]
+        raise ConfigError("\n".join(lines))
+
+    for w in warnings:
+        print(f"[config][WARN] {w}", file=sys.stderr)
+
+
+# ---------------------------------------------------------------------------
 # 搜索层
 # ---------------------------------------------------------------------------
 
@@ -301,9 +370,9 @@ def build_html_report(leads, generated_at):
 # ---------------------------------------------------------------------------
 
 def send_email(subject, html):
-    server = cfg("MAIL_SERVER")
+    server = _first_set(MAIL_HOST_ALIASES)
     port = int(cfg("MAIL_PORT", "465"))
-    username = cfg("MAIL_USERNAME")
+    username = _first_set(MAIL_USER_ALIASES)
     password = cfg("MAIL_PASSWORD")
     recipient = cfg("MAIL_RECIPIENT", "Hank@alumcasting.com")
     sender = cfg("MAIL_SENDER") or username
@@ -366,6 +435,13 @@ def send_email(subject, html):
 # ---------------------------------------------------------------------------
 
 def main():
+    # 启动期校验：配置缺失 / 无效时尽早失败并给出可读信息（不泄露 secret 值）
+    try:
+        validate_config()
+    except ConfigError as e:
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
+
     tz = timezone(timedelta(hours=8))
     now = datetime.now(tz)
     generated_at = now.strftime("%Y-%m-%d %H:%M (GMT+8)")
