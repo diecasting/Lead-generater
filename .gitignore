@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 leads_report.html
 leads_report.json
+sent_cache.json

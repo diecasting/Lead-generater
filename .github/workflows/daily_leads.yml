@@ -37,6 +37,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # 跨运行持久化「已推送线索」缓存，使去重机制在 GitHub Actions 中真正生效
+      - name: Cache sent history (dedup across runs)
+        uses: actions/cache@v4
+        with:
+          path: sent_cache.json
+          key: sent-history-cache-v1
+
       - name: Run lead collector
         run: python main.py
 

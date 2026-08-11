@@ -10,8 +10,10 @@ Daily Lead Collector — CNC / Die Casting / Casting / Plastic Injection Molding
 
 流程：
   1. 多关键词搜索（Bing Web Search API，未配置 Key 时回退到 DuckDuckGo 公开搜索）
-  2. 调用大模型 API 清洗、过滤垃圾信息，抽取结构化线索
-  3. 生成美观的 HTML 日报，通过 SMTP (SSL / STARTTLS) 发送至指定邮箱
+  2. 优先调用大模型 API 清洗、过滤垃圾信息；遇 429 / 超时 / 无额度时自动
+     指数退避重试，并回退到本地规则清洗，确保不丢线索
+  3. 生成美观、响应式的 HTML 日报（含意向评级、可点击来源），通过 SMTP
+     (SSL / STARTTLS) 发送；并按 sent_cache.json 历史去重，避免重复推送
 
 所有敏感配置均来自环境变量 / GitHub Secrets，不写死在代码中。
 """
@@ -20,6 +22,7 @@ import os
 import re
 import json
 import sys
+import time
 import ssl
 import smtplib
 import socket
@@ -53,6 +56,14 @@ KEYWORDS = [
 
 SEARCH_PER_KEYWORD = int(os.getenv("SEARCH_PER_KEYWORD", "10"))
 RESULTS_LIMIT = int(os.getenv("LEADS_LIMIT", "15"))
+
+# AI 容灾：指数退避重试（应对 429 / 超时 / 网络抖动）
+MAX_RETRIES = int(os.getenv("AI_MAX_RETRIES", "2"))
+RETRY_BASE_DELAY = int(os.getenv("AI_RETRY_BASE_DELAY", "3"))  # 秒
+
+# 历史去重：已推送线索缓存文件路径
+HISTORY_FILE = os.getenv("HISTORY_FILE", "sent_cache.json")
+HISTORY_MAX = int(os.getenv("HISTORY_MAX", "2000"))  # 防止缓存无限增长
 
 
 def cfg(name, default=None):
@@ -349,8 +360,27 @@ def clean_with_rules(raw_results):
     return scored[:RESULTS_LIMIT]
 
 
+def _is_retryable(e):
+    """判断异常是否值得重试：429 限流 / 超时 / 网络抖动可重试；
+    4xx 其它（如 401 认证失败）重试无意义，直接跳过。"""
+    status = getattr(e, "status", None)
+    if status == 429:
+        return True
+    if status is not None and 400 <= status < 500 and status != 429:
+        return False  # 4xx 客户端错误（含 401/403）不应重试
+    name = type(e).__name__.lower()
+    if any(k in name for k in ("timeout", "connection", "ratelimit", "servererror")):
+        return True
+    txt = str(e).lower()
+    if any(k in txt for k in ("429", "too many requests", "timeout", "timed out",
+                              "connection", "rate limit", "emporarily")):
+        return True
+    return False
+
+
 def clean_with_ai(raw_results):
-    """优先用大模型清洗；任何失败（缺密钥 / 429 额度不足 / 网络错误）自动回退规则清洗。"""
+    """优先用大模型清洗；遇 429 / 超时 / 网络错误自动指数退避重试（1-2 次），
+    重试仍失败或完全无密钥时，回退到确定性的本地规则清洗，确保当天线索不丢失。"""
     api_key = cfg("OPENAI_API_KEY")
 
     # 1) 完全没配置密钥或 SDK 不可用 -> 直接走规则清洗
@@ -365,34 +395,43 @@ def clean_with_ai(raw_results):
         base_url=cfg("OPENAI_BASE_URL") or None,   # 兼容 Azure / OpenRouter 等
     )
     model = cfg("OPENAI_MODEL", "gpt-4o-mini")
-
     payload = json.dumps(raw_results, ensure_ascii=False, indent=2)
-    try:
-        resp = client.chat.completions.create(
-            model=model,
-            temperature=0.2,
-            response_format={"type": "json_object"},
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": "Raw search results (JSON):\n\n" + payload},
-            ],
-        )
-        content = resp.choices[0].message.content or "{}"
-        data = json.loads(content)
-        leads = data.get("leads", [])
-        if not leads:
-            print("[ai] 大模型未返回任何合格线索；回退到基于规则的本地清洗。",
-                  file=sys.stderr)
+
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                temperature=0.2,
+                response_format={"type": "json_object"},
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": "Raw search results (JSON):\n\n" + payload},
+                ],
+            )
+            content = resp.choices[0].message.content or "{}"
+            data = json.loads(content)
+            leads = data.get("leads", [])
+            if not leads:
+                print("[ai] 大模型未返回任何合格线索；回退到基于规则的本地清洗。",
+                      file=sys.stderr)
+                return clean_with_rules(raw_results)
+            return leads[:RESULTS_LIMIT]
+        except Exception as e:
+            if attempt < MAX_RETRIES and _is_retryable(e):
+                delay = RETRY_BASE_DELAY * (2 ** attempt)  # 指数退避：3s, 6s ...
+                print(f"[ai] 调用失败 ({type(e).__name__})，{delay}s 后重试 "
+                      f"({attempt + 1}/{MAX_RETRIES}) ...", file=sys.stderr)
+                time.sleep(delay)
+                continue
+            # 不可重试 或 重试耗尽 -> 规则回退，绝不丢弃当天线索
+            reason = type(e).__name__
+            if getattr(e, "status", None) == 429 or "insufficient" in str(e).lower():
+                reason = "429 insufficient_quota"
+            print(f"[ai] 大模型清洗最终失败 ({reason})；"
+                  "回退到基于规则的本地清洗，确保今日线索不丢失。", file=sys.stderr)
             return clean_with_rules(raw_results)
-        return leads[:RESULTS_LIMIT]
-    except Exception as e:
-        # 429 额度不足 / 网络不通 / 超时 等任意异常 -> 启用规则回退，不让当天线索丢失
-        reason = type(e).__name__
-        if getattr(e, "status", None) == 429 or "insufficient" in str(e).lower():
-            reason = "429 insufficient_quota"
-        print(f"[ai] 大模型清洗调用失败 ({reason})；"
-              "回退到基于规则的本地清洗，确保今日线索不丢失。", file=sys.stderr)
-        return clean_with_rules(raw_results)
+    # 理论不可达（循环内必然 return），仅作保险兜底
+    return clean_with_rules(raw_results)
 
 
 # ---------------------------------------------------------------------------
@@ -406,37 +445,32 @@ def esc(s):
 
 def build_html_report(leads, generated_at):
     if not leads:
-        body = ('<p class="empty">今天没有匹配到高质量的潜在客户线索。'
-                '可能是搜索结果较少，或 AI 过滤未通过。明天继续监控。</p>')
+        body = ('<p class="empty">今天没有匹配到新的潜在客户线索'
+                '（可能是搜索结果较少、AI 过滤未通过，或均为已推送过的重复线索）。'
+                '明天继续监控。</p>')
     else:
-        rows = []
+        cards = []
         for i, l in enumerate(leads, 1):
             conf = (l.get("confidence") or "low").lower()
-            badge = {
-                "high": '<span class="badge high">高</span>',
-                "medium": '<span class="badge medium">中</span>',
-                "low": '<span class="badge low">低</span>',
-            }.get(conf, '<span class="badge low">低</span>')
+            conf_cn = {"high": "高意向", "medium": "中等意向", "low": "低意向"}.get(conf, "低意向")
+            badge = f'<span class="badge {conf}">{conf_cn}</span>'
+            kw = esc(l.get("keyword", ""))
+            kw_tag = f'<span class="tag">#{kw}</span>' if kw else ""
             url = l.get("source_url", "") or "#"
-            rows.append(f"""
-            <tr>
-              <td class="num">{i}</td>
-              <td><strong>{esc(l.get('company', 'Unknown'))}</strong></td>
-              <td>{esc(l.get('need_summary', ''))}</td>
-              <td>{esc(l.get('keyword', ''))}</td>
-              <td>{badge}</td>
-              <td><a href="{esc(url)}" target="_blank" rel="noopener">查看来源</a></td>
-            </tr>""")
-        body = f"""
-        <table>
-          <thead>
-            <tr>
-              <th>#</th><th>客户 / 买家</th><th>需求摘要</th>
-              <th>触发关键词</th><th>置信度</th><th>来源</th>
-            </tr>
-          </thead>
-          <tbody>{''.join(rows)}</tbody>
-        </table>"""
+            company = esc(l.get("company", "Unknown"))
+            summary = esc(l.get("need_summary", "")) or "（无摘要）"
+            cards.append(f"""
+            <div class="lead">
+              <div class="lead-top">
+                <span class="idx">#{i}</span>
+                {badge}
+                {kw_tag}
+              </div>
+              <a class="lead-title" href="{esc(url)}" target="_blank" rel="noopener">{company}</a>
+              <p class="lead-summary">{summary}</p>
+              <a class="lead-link" href="{esc(url)}" target="_blank" rel="noopener">查看原始来源 ↗</a>
+            </div>""")
+        body = "".join(cards)
 
     return f"""<!DOCTYPE html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -444,33 +478,90 @@ def build_html_report(leads, generated_at):
 <title>每日潜在客户线索日报</title>
 <style>
   body {{ font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif; background:#f4f6f9; margin:0; color:#1f2d3d; }}
-  .wrap {{ max-width: 920px; margin: 0 auto; padding: 28px 20px; }}
-  .header {{ background: linear-gradient(135deg,#0d4a8e,#1e88e5); color:#fff; border-radius:12px; padding:24px 28px; }}
-  .header h1 {{ margin:0 0 6px; font-size:22px; }}
-  .header p {{ margin:0; opacity:.9; font-size:13px; }}
-  .card {{ background:#fff; border-radius:12px; padding:22px; margin-top:18px; box-shadow:0 2px 10px rgba(0,0,0,.05); overflow-x:auto; }}
-  table {{ width:100%; border-collapse:collapse; font-size:14px; }}
-  th, td {{ text-align:left; padding:11px 10px; border-bottom:1px solid #eef1f5; vertical-align:top; }}
-  th {{ background:#f7f9fc; color:#5a6b7b; font-weight:600; font-size:12px; text-transform:uppercase; letter-spacing:.03em; }}
-  .num {{ color:#9aa7b4; width:28px; }}
-  a {{ color:#1e88e5; text-decoration:none; }}
-  a:hover {{ text-decoration:underline; }}
-  .badge {{ display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600; }}
+  .wrap {{ max-width: 720px; margin: 0 auto; padding: 24px 16px; }}
+  .header {{ background: linear-gradient(135deg,#0d4a8e,#1e88e5); color:#fff; border-radius:14px; padding:22px 24px; }}
+  .header h1 {{ margin:0 0 6px; font-size:20px; }}
+  .header p {{ margin:0; opacity:.92; font-size:13px; line-height:1.5; }}
+  .card {{ background:#fff; border-radius:14px; padding:18px; margin-top:16px; box-shadow:0 2px 10px rgba(0,0,0,.05); }}
+  .lead {{ border:1px solid #eef1f5; border-radius:12px; padding:14px 16px; margin-bottom:12px; background:#fcfdfe; }}
+  .lead:last-child {{ margin-bottom:0; }}
+  .lead-top {{ display:flex; align-items:center; gap:8px; flex-wrap:wrap; margin-bottom:8px; }}
+  .idx {{ color:#9aa7b4; font-size:13px; font-weight:600; }}
+  .tag {{ display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; background:#eef4fb; color:#2b6cb0; }}
+  .badge {{ display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:700; }}
   .badge.high {{ background:#e6f7ec; color:#1a8a4f; }}
   .badge.medium {{ background:#fff4e0; color:#b9770e; }}
   .badge.low {{ background:#f0f2f5; color:#7a8794; }}
-  .empty {{ color:#7a8794; padding:14px 0; }}
-  .footer {{ text-align:center; color:#9aa7b4; font-size:12px; margin-top:20px; }}
+  .lead-title {{ display:block; font-size:16px; font-weight:700; color:#15233a; text-decoration:none; line-height:1.35; }}
+  .lead-title:hover {{ color:#1e88e5; }}
+  .lead-summary {{ margin:8px 0 10px; font-size:14px; line-height:1.6; color:#415062; }}
+  .lead-link {{ display:inline-block; font-size:13px; color:#1e88e5; text-decoration:none; font-weight:600; }}
+  .lead-link:hover {{ text-decoration:underline; }}
+  .empty {{ color:#7a8794; padding:14px 0; line-height:1.6; }}
+  .footer {{ text-align:center; color:#9aa7b4; font-size:12px; margin-top:18px; line-height:1.6; }}
+  @media (max-width:480px) {{
+    .wrap {{ padding:14px 10px; }}
+    .lead-title {{ font-size:15px; }}
+    .lead-summary {{ font-size:13px; }}
+  }}
 </style></head>
 <body><div class="wrap">
   <div class="header">
     <h1>🔧 每日潜在客户线索日报</h1>
     <p>垂直行业：CNC 加工 · 压铸 (Die Casting) · 铸造 (Casting) · 塑胶模具与注塑</p>
-    <p>生成时间：{generated_at}</p>
+    <p>生成时间：{generated_at} · 共 {len(leads)} 条新线索</p>
   </div>
   <div class="card">{body}</div>
-  <div class="footer">本邮件由 GitHub Actions 自动生成 · 共 {len(leads)} 条线索</div>
+  <div class="footer">本邮件由 GitHub Actions 自动生成 · 仅供商务拓展参考<br>重复线索已按历史记录自动过滤</div>
 </div></body></html>"""
+
+
+# ---------------------------------------------------------------------------
+# 历史去重（防止重复推送同一线索）
+# ---------------------------------------------------------------------------
+
+def load_sent_history(path=HISTORY_FILE):
+    """读取已推送线索 URL 集合；文件缺失 / 损坏时返回空集合。"""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
+        return set()
+    if isinstance(data, list):
+        return set(data)
+    if isinstance(data, dict):
+        return set(data.get("urls", []))
+    return set()
+
+
+def save_sent_history(urls, path=HISTORY_FILE, max_len=HISTORY_MAX):
+    """将本次新推送的 URL 合并写入缓存；超出上限时仅保留最近 max_len 条。"""
+    urls = [u for u in urls if u]
+    if not urls:
+        return
+    existing = load_sent_history(path)
+    existing.update(urls)
+    if len(existing) > max_len:
+        existing = set(list(existing)[-max_len:])
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(sorted(existing), f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"[history] 写入缓存失败：{e}", file=sys.stderr)
+
+
+def dedupe_leads(leads, history):
+    """过滤掉历史已推送过的线索；无 URL 的线索不做去重（始终视为新）。"""
+    kept, dropped = [], 0
+    for l in leads:
+        url = l.get("source_url")
+        if url and url in history:
+            dropped += 1
+            continue
+        kept.append(l)
+    if dropped:
+        print(f"[dedup] 已过滤 {dropped} 条历史重复线索。", file=sys.stderr)
+    return kept
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +653,11 @@ def main():
     leads = clean_with_ai(raw)
     print(f"==> 过滤后剩余 {len(leads)} 条合格线索。")
 
+    # 历史去重：仅推送未发送过的新线索
+    history = load_sent_history()
+    leads = dedupe_leads(leads, history)
+    print(f"==> 去重后剩余 {len(leads)} 条新线索待推送。")
+
     html = build_html_report(leads, generated_at)
 
     # 始终保存产物，方便在 Actions 运行记录中查看
@@ -571,9 +667,16 @@ def main():
         json.dump({"generated_at": generated_at, "leads": leads},
                   f, ensure_ascii=False, indent=2)
 
-    subject = f"每日潜在客户线索日报 · {now.strftime('%Y-%m-%d')} · {len(leads)} 条"
-    send_email(subject, html)
-    print("==> 完成。")
+    subject = f"每日潜在客户线索日报 · {now.strftime('%Y-%m-%d')} · {len(leads)} 条新线索"
+    sent = send_email(subject, html)
+
+    # 推送成功后才将本次线索写入历史缓存，确保不重复推送
+    if sent:
+        save_sent_history([l.get("source_url") for l in leads])
+        print("==> 完成，历史缓存已更新。")
+    else:
+        print("==> 邮件发送未成功，本次线索不写入历史缓存（下次运行将重试）。",
+              file=sys.stderr)
 
 
 if __name__ == "__main__":
