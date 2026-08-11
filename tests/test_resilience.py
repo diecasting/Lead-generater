@@ -54,7 +54,9 @@ def test_build_html_has_intent_and_link():
         "confidence": "high",
     }]
     html = main.build_html_report(leads, "2026-08-11 08:00 (GMT+8)")
-    assert "高意向" in html
+    # 报告应展示意向等级标签（🔥/⚡/💤 之一）与可点击来源链接
+    assert any(t in html for t in ("🔥 高意向", "⚡ 中意向", "💤 低意向"))
+    assert "意向分" in html
     assert 'href="http://acme.com/rfq"' in html
     assert "Acme Corp" in html
 

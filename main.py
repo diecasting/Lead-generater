@@ -16,7 +16,11 @@ Daily Lead Collector — CNC / Die Casting / Casting / Plastic Injection Molding
      指数退避重试，并回退到本地规则清洗，确保不丢线索
   3. 网页邮箱提取：对每条线索的来源页面用正则抓取并过滤真实联系邮箱
      （过滤静态资源后缀、example.com 占位、no-reply 等垃圾邮箱）
-  4. 生成美观、响应式的 HTML 日报（含意向评级、可点击来源、✉️ 邮箱），
+  4. 垃圾站点过滤：剔除知乎 / 维基 / 博客 / 中介广告等，只留真实买家；
+     并引入垂直黄页与专业社区定向搜索（site:thomasnet.com 等）
+  5. 意向评分(0-100)：依据置信度、真实企业邮箱、具体工艺/材质/图纸/采购数量加权，
+     按分数排序并打上 🔥 高意向 / ⚡ 中意向 标签；同时为每条线索生成个性化英文开发信
+  6. 生成美观、响应式的 HTML 日报（含意向分、可点击来源、✉️ 邮箱、开发信草稿），
      通过 SMTP (SSL / STARTTLS) 发送；并按 sent_cache.json 历史去重，避免重复推送
 
 所有敏感配置均来自环境变量 / GitHub Secrets，不写死在代码中。
@@ -128,6 +132,19 @@ RETRY_BASE_DELAY = int(os.getenv("AI_RETRY_BASE_DELAY", "3"))  # 秒
 # 历史去重：已推送线索缓存文件路径
 HISTORY_FILE = os.getenv("HISTORY_FILE", "sent_cache.json")
 HISTORY_MAX = int(os.getenv("HISTORY_MAX", "2000"))  # 防止缓存无限增长
+
+# 垂直黄页 / 专业社区定向搜索（site: 限制），可经环境变量覆盖
+DIRECTORY_SITES = [
+    s.strip()
+    for s in os.getenv(
+        "DIRECTORY_SITES",
+        "thomasnet.com,kompass.com,reddit.com/r/manufacturing,"
+        "engineering.com,globalspec.com",
+    ).split(",")
+    if s.strip()
+]
+DIRECTORY_SEARCH = str(os.getenv("DIRECTORY_SEARCH", "1")).lower() in ("1", "true", "yes")
+DIRECTORY_MAX_QUERIES = int(os.getenv("DIRECTORY_MAX_QUERIES", "12"))
 
 
 def cfg(name, default=None):
@@ -284,11 +301,28 @@ def ddg_search(query, count=SEARCH_PER_KEYWORD):
     return out
 
 
+def get_directory_queries(keywords):
+    """将关键词与垂直站点轮询配对，生成 site: 限定查询（受 DIRECTORY_MAX_QUERIES 限制）。
+
+    例如 `aluminum die casting RFQ site:thomasnet.com`，精准捕获黄页 / 社区的高价值线索。
+    """
+    if not (DIRECTORY_SEARCH and DIRECTORY_SITES):
+        return []
+    # 轮询配对：每个站点均匀分摊查询，避免单一站点占满配额
+    pairs = []
+    for i, kw in enumerate(keywords):
+        site = DIRECTORY_SITES[i % len(DIRECTORY_SITES)]
+        pairs.append((kw, site))
+    return [f"{kw} site:{site}" for kw, site in pairs[:DIRECTORY_MAX_QUERIES]]
+
+
 def collect_raw_leads():
     bing_key = cfg("BING_API_KEY")
     keywords = get_search_keywords()
     print(f"[search] 共 {len(keywords)} 个检索关键词。")
     results = []
+
+    # 1) 普通关键词搜索（覆盖全网）
     for kw in keywords:
         print(f"[search] '{kw}'")
         try:
@@ -298,6 +332,20 @@ def collect_raw_leads():
                 results.extend(ddg_search(kw))
         except Exception as e:
             print(f"[search] error on '{kw}': {e}", file=sys.stderr)
+
+    # 2) 定向黄页 / 专业社区搜索（site: 限制）
+    dq = get_directory_queries(keywords)
+    if dq:
+        print(f"[search] 定向黄页/社区查询 {len(dq)} 条（site: 限制）。")
+        for q in dq:
+            print(f"[search] '{q}'")
+            try:
+                if bing_key:
+                    results.extend(bing_search(q, bing_key))
+                else:
+                    results.extend(ddg_search(q))
+            except Exception as e:
+                print(f"[search] error on '{q}': {e}", file=sys.stderr)
     return results
 
 
@@ -412,7 +460,7 @@ def clean_with_rules(raw_results):
         if buy >= 2 and ad < 2 and noise == 0 and score >= RULE_MIN_SCORE:
             conf = "high" if score >= 8 else ("medium" if score >= 5 else "low")
             scored.append({
-                "company": _company_from_result(r),
+                "company": extract_company_name(r.get("title"), r.get("url"), r.get("snippet")),
                 "need_summary": (r.get("snippet") or r.get("title") or "")[:160],
                 "source_url": url,
                 "keyword": r.get("keyword", ""),
@@ -617,6 +665,204 @@ def enrich_leads_with_emails(leads):
 
 
 # ---------------------------------------------------------------------------
+# 增强模块：黑名单过滤 · 公司名提取 · 意向评分(0-100) · 个性化开发信
+# ---------------------------------------------------------------------------
+
+def _domain_of(url):
+    """从 URL 中提取主机名（去掉 www. 前缀）。"""
+    try:
+        netloc = urlparse(url).netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc
+    except Exception:
+        return ""
+
+
+def _email_domain(email):
+    return email.rpartition("@")[2].lower()
+
+
+# 垃圾 / 纯内容站点黑名单（知乎、维基、问答、博客、视频、资讯等）
+BLACKLIST_DOMAINS = (
+    "zhihu.com", "wikipedia.org", "wikihow.com", "quora.com", "medium.com",
+    "pinterest.com", "youtube.com", "vimeo.com", "blogspot.com", "wordpress.com",
+    "substack.com", "tumblr.com", "cnn.com", "bbc.com", "nytimes.com",
+)
+# 通用博客 / 资讯主机后缀
+BLACKLIST_DOMAIN_SUFFIX = (".blogspot.com", ".wordpress.com", ".substack.com")
+# 标题 / 摘要中的纯内容或中介广告信号（命中即视为垃圾）
+BLACKLIST_KEYWORDS = (
+    "how to", "what is", "what are", "guide to", "top 10", "best of", "review of",
+    "vs ", " explained", "tutorial", "salary", "job opening", "hiring",
+    "definition of", "freelance", "upwork", "fiverr", "affiliate", "sponsored",
+)
+
+
+def is_blacklisted(url, title="", snippet=""):
+    """判断一条原始结果是否来自垃圾站点 / 纯内容站 / 中介广告。"""
+    domain = _domain_of(url)
+    if domain in BLACKLIST_DOMAINS:
+        return True
+    # 同时匹配子域名（如 en.wikipedia.org）
+    if any(domain == bd or domain.endswith("." + bd) for bd in BLACKLIST_DOMAINS):
+        return True
+    if any(domain.endswith(s) for s in BLACKLIST_DOMAIN_SUFFIX):
+        return True
+    text = f"{title} {snippet}".lower()
+    if any(k in text for k in BLACKLIST_KEYWORDS):
+        return True
+    return False
+
+
+def filter_blacklist(raw_results):
+    """过滤掉垃圾站点 / 纯内容 / 中介广告，仅保留潜在的真实买家线索。"""
+    kept, dropped = [], 0
+    for r in raw_results:
+        if is_blacklisted(r.get("url", ""), r.get("title", ""), r.get("snippet", "")):
+            dropped += 1
+            continue
+        kept.append(r)
+    if dropped:
+        print(f"[filter] 已过滤 {dropped} 条垃圾/内容站点结果。", file=sys.stderr)
+    return kept
+
+
+# 公司名提取：优先从标题拆分出机构名，失败回退到域名
+def extract_company_name(title, url, snippet=""):
+    cand = (title or "").strip()
+    for sep in [" | ", " - ", " – ", " :: ", " — ", " · ", " » ", " > "]:
+        if sep in cand:
+            cand = cand.split(sep)[0].strip()
+            break
+    # 去掉描述性后缀词（采购意图 / 行业词），保留机构主体
+    cand = re.sub(
+        r"\b(rfq|inquiry|enquiry|buyer|request for quote|sourcing|supplier|"
+        r"manufacturer|quote|wanted|needed|looking for)\b.*$",
+        "", cand, flags=re.I,
+    ).strip(" .,-|：:•")
+    if cand and 2 <= len(cand) <= 60 and not cand.lower().startswith(
+        ("how ", "what ", "why ", "the ", "a ", "an ", "top ", "best ")):
+        return cand[:60]
+    domain = _domain_of(url).split(".")[0]
+    if domain and domain != "www":
+        return domain.capitalize()
+    return "Unknown"
+
+
+# ----- 意向评分（0-100）加权项 -----
+MATERIAL_PATTERNS = [
+    r"aluminium|aluminum", r"zinc", r"steel|stainless", r"magnesium",
+    r"titanium", r"brass|bronze", r"plastic|abs| nylon|peek|polymer", r"copper",
+]
+PARAM_PATTERNS = [
+    r"tolerance", r"micron|µm", r"\bmm\b|\binch\b", r"surface finish",
+    r"anodiz", r"heat treat", r"thread", r"hardness", r"gd&t",
+]
+DRAWING_PATTERNS = [
+    r"drawing", r"\bcad\b", r"step file|iges|dxf|\bstp\b", r"blueprint",
+    r"3d model", r"technical spec",
+]
+QTY_PATTERNS = [
+    r"\bpcs\b|pieces|units", r"\bmoq\b|minimum order", r"\bbatch\b",
+    r"\d{2,3}\s?(pcs|pieces|units|k)\b", r"quantity|volume|annual demand",
+]
+FREE_EMAIL_DOMAINS = (
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "live.com",
+    "163.com", "qq.com", "126.com", "protonmail.com", "icloud.com",
+)
+# 高价值来源（垂直黄页 / 专业社区）加分
+HIGH_QUALITY_DOMAINS = (
+    set(DIRECTORY_SITES)
+    | {"thomasnet.com", "kompass.com", "globalspec.com", "engineering.com"}
+)
+
+
+def score_lead(lead):
+    """0-100 意向评分：基础分(置信度) + 真实企业邮箱 + 具体工艺/材质/图纸/数量。"""
+    score = {"high": 40, "medium": 25, "low": 10}.get(
+        (lead.get("confidence") or "low").lower(), 10)
+    emails = lead.get("emails") or []
+    if emails:
+        score += 20
+        # 至少一个非免费邮箱（企业域名）再加分
+        if any(_email_domain(e) not in FREE_EMAIL_DOMAINS for e in emails if "@" in e):
+            score += 10
+    text = " ".join([
+        lead.get("need_summary", ""), lead.get("keyword", ""),
+        lead.get("source_url", ""),
+    ]).lower()
+    if any(re.search(p, text) for p in MATERIAL_PATTERNS):
+        score += 8
+    if any(re.search(p, text) for p in PARAM_PATTERNS):
+        score += 8
+    if any(re.search(p, text) for p in DRAWING_PATTERNS):
+        score += 8
+    if any(re.search(p, text) for p in QTY_PATTERNS):
+        score += 8
+    url = (lead.get("source_url") or "").lower()
+    if any(d in url for d in HIGH_QUALITY_DOMAINS):
+        score += 10
+    return max(0, min(100, score))
+
+
+def tier_from_score(score):
+    """根据分数返回 (中文标签, 样式类)。"""
+    if score >= 70:
+        return ("🔥 高意向", "hot")
+    if score >= 45:
+        return ("⚡ 中意向", "mid")
+    return ("💤 低意向", "low")
+
+
+def matched_capabilities(text):
+    """根据线索文本匹配我们对应的制造能力，用于开发信个性化。"""
+    t = (text or "").lower()
+    caps = []
+    if re.search(r"\bcnc\b|machin|milling|turning|5[- ]?axis", t):
+        caps.append("CNC machining (3/5-axis milling & turning)")
+    if re.search(r"die[- ]?cast|aluminium? casting|zinc casting|magnesium", t):
+        caps.append("aluminum / zinc die casting")
+    if re.search(r"\bcast|sand cast|gravity cast", t):
+        caps.append("sand & gravity casting")
+    if re.search(r"injection|mold|mould|plastic part", t):
+        caps.append("plastic injection molding & tooling")
+    if re.search(r"stamp|fabricat|sheet metal", t):
+        caps.append("metal stamping & fabrication")
+    return caps
+
+
+def generate_cold_email(lead):
+    """为合格线索生成简短、专业的英文破冰开发信（模板，无需 API，稳定可靠）。"""
+    company = (lead.get("company") or "there").strip()
+    if company.lower() in ("unknown", "", "there"):
+        company = "there"
+    summary = (lead.get("need_summary") or "").strip()
+    keyword = lead.get("keyword", "")
+    caps = matched_capabilities(f"{summary} {keyword}")
+    cap_sentence = (
+        ", ".join(caps) if caps else
+        "CNC machining, aluminum die casting, and plastic injection molding"
+    )
+    ref = summary if summary else f"your recent '{keyword}' sourcing request"
+    return (
+        f"Subject: Precision manufacturing support for {company}\n\n"
+        f"Hi {company} team,\n\n"
+        f"I came across {ref} and wanted to introduce AlumCasting as a "
+        f"potential manufacturing partner. We specialize in {cap_sentence}, "
+        f"with in-house tooling, strict tolerance control, and flexible "
+        f"low-to-high volume production.\n\n"
+        f"If you're still evaluating suppliers, I'd be glad to share our "
+        f"capability portfolio, similar-project references, and a competitive "
+        f"quote. Feel free to reply with your drawing or requirements.\n\n"
+        f"Best regards,\n"
+        f"Hank\n"
+        f"AlumCasting — Precision Manufacturing\n"
+        f"Email: Hank@alumcasting.com"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 报告渲染
 # ---------------------------------------------------------------------------
 
@@ -633,9 +879,10 @@ def build_html_report(leads, generated_at):
     else:
         cards = []
         for i, l in enumerate(leads, 1):
-            conf = (l.get("confidence") or "low").lower()
-            conf_cn = {"high": "高意向", "medium": "中等意向", "low": "低意向"}.get(conf, "低意向")
-            badge = f'<span class="badge {conf}">{conf_cn}</span>'
+            score = int(l.get("score", 0) or 0)
+            tier_label, tier_cls = tier_from_score(score)
+            badge = f'<span class="badge {tier_cls}">{tier_label}</span>'
+            score_span = f'<span class="score">意向分 {score}</span>'
             kw = esc(l.get("keyword", ""))
             kw_tag = f'<span class="tag">#{kw}</span>' if kw else ""
             url = l.get("source_url", "") or "#"
@@ -650,16 +897,23 @@ def build_html_report(leads, generated_at):
                 email_block = f'<p class="lead-email">✉️ 邮箱: {email_links}</p>'
             else:
                 email_block = '<p class="lead-email none">✉️ 邮箱: 未公开</p>'
+            cold = l.get("cold_email") or ""
+            cold_block = (
+                '<details class="cold"><summary>✍️ 英文开发信草稿（点击展开/复制）</summary>'
+                f'<pre>{esc(cold)}</pre></details>'
+            ) if cold else ""
             cards.append(f"""
             <div class="lead">
               <div class="lead-top">
                 <span class="idx">#{i}</span>
                 {badge}
+                {score_span}
                 {kw_tag}
               </div>
               <a class="lead-title" href="{esc(url)}" target="_blank" rel="noopener">{company}</a>
               <p class="lead-summary">{summary}</p>
               {email_block}
+              {cold_block}
               <a class="lead-link" href="{esc(url)}" target="_blank" rel="noopener">查看原始来源 ↗</a>
             </div>""")
         body = "".join(cards)
@@ -681,9 +935,10 @@ def build_html_report(leads, generated_at):
   .idx {{ color:#9aa7b4; font-size:13px; font-weight:600; }}
   .tag {{ display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; background:#eef4fb; color:#2b6cb0; }}
   .badge {{ display:inline-block; padding:2px 10px; border-radius:999px; font-size:12px; font-weight:700; }}
-  .badge.high {{ background:#e6f7ec; color:#1a8a4f; }}
+  .badge.high {{ background:#fdecea; color:#c0392b; }}
   .badge.medium {{ background:#fff4e0; color:#b9770e; }}
-  .badge.low {{ background:#f0f2f5; color:#7a8794; }}
+  .badge.low {{ background:#eef2f6; color:#7a8794; }}
+  .score {{ display:inline-block; padding:2px 9px; border-radius:999px; font-size:12px; font-weight:600; background:#eef4fb; color:#2b6cb0; }}
   .lead-title {{ display:block; font-size:16px; font-weight:700; color:#15233a; text-decoration:none; line-height:1.35; }}
   .lead-title:hover {{ color:#1e88e5; }}
   .lead-summary {{ margin:8px 0 10px; font-size:14px; line-height:1.6; color:#415062; }}
@@ -693,6 +948,9 @@ def build_html_report(leads, generated_at):
   .lead-email .email {{ color:#c0392b; text-decoration:none; font-weight:600; }}
   .lead-email .email:hover {{ text-decoration:underline; }}
   .lead-email.none {{ color:#9aa7b4; font-style:italic; }}
+  .cold {{ margin:10px 0; border:1px dashed #cfd8e3; border-radius:10px; padding:8px 12px; background:#fbfcfe; }}
+  .cold summary {{ cursor:pointer; font-size:13px; font-weight:600; color:#2b6cb0; user-select:none; }}
+  .cold pre {{ white-space:pre-wrap; word-break:break-word; font-family:"SFMono-Regular",Consolas,"Liberation Mono",Menlo,monospace; font-size:12.5px; line-height:1.55; color:#2c3e50; margin:8px 0 2px; }}
   .empty {{ color:#7a8794; padding:14px 0; line-height:1.6; }}
   .footer {{ text-align:center; color:#9aa7b4; font-size:12px; margin-top:18px; line-height:1.6; }}
   @media (max-width:480px) {{
@@ -845,6 +1103,10 @@ def main():
     raw = collect_raw_leads()
     print(f"==> 共收集到 {len(raw)} 条原始结果。")
 
+    # 黑名单过滤：剔除知乎/维基/博客/中介广告等垃圾站点，只留真实买家
+    raw = filter_blacklist(raw)
+    print(f"==> 过滤后剩余 {len(raw)} 条待清洗原始结果。")
+
     print("==> 调用 AI 清洗与过滤 ...")
     leads = clean_with_ai(raw)
     print(f"==> 过滤后剩余 {len(leads)} 条合格线索。")
@@ -858,6 +1120,15 @@ def main():
     leads = enrich_leads_with_emails(leads)
     total_emails = sum(len(l.get("emails") or []) for l in leads)
     print(f"==> 邮箱提取完成：共从 {len(leads)} 条线索中解析到 {total_emails} 个邮箱。")
+
+    # 意向评分(0-100) + 个性化英文开发信，并按分数从高到低排序
+    for l in leads:
+        if (l.get("company") or "Unknown") in ("Unknown", "", None):
+            l["company"] = extract_company_name("", l.get("source_url", ""))
+        l["score"] = score_lead(l)
+        l["cold_email"] = generate_cold_email(l)
+    leads.sort(key=lambda x: x.get("score", 0), reverse=True)
+    print(f"==> 已为 {len(leads)} 条线索评分并生成开发信，按意向分排序完成。")
 
     html = build_html_report(leads, generated_at)
 

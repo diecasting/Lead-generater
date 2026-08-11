@@ -12,19 +12,23 @@
 ```
 GitHub Actions (每天 UTC 00:00 / 北京 08:00)
         │
-        ├─► 1. 多关键词搜索
+        ├─► 1. 多关键词搜索（含垂直黄页/社区定向搜索 site:thomasnet.com 等）
         │       ├─ Bing Web Search API（配置了 BING_API_KEY 时）
         │       └─ DuckDuckGo 公开搜索（未配置时的回退方案）
         │
-        ├─► 2. AI 智能清洗过滤
-        │       调用大模型 API，剔除新闻/教程/供应商自广告等噪声，
+        ├─► 2. 垃圾站点过滤
+        │       剔除知乎/维基/博客/中介广告等，只保留真实买家线索
+        │
+        ├─► 3. AI 智能清洗过滤（失败自动回退规则清洗）
         │       抽取：客户/买家、需求摘要、来源网址、置信度
         │
-        └─► 3. 邮件推送
-               生成 HTML 日报，经 SMTP (SSL 或 STARTTLS) 发送至 Hank@alumcasting.com
+        ├─► 4. 网页邮箱提取 + 意向评分(0-100) + 个性化英文开发信
+        │
+        └─► 5. 邮件推送（按意向分排序、🔥/⚡ 等级标签、含开发信草稿）
+               经 SMTP (SSL 或 STARTTLS) 发送至 Hank@alumcasting.com
 ```
 
-> 说明：若 `OPENAI_API_KEY` 未配置、额度不足（429）或网络异常，系统会自动回退到**基于关键词规则的本地清洗**，当天线索不会丢失；同一来源的线索会按 `sent_cache.json` 历史去重，避免重复推送。
+> 说明：若 `OPENAI_API_KEY` 未配置、额度不足（429）或网络异常，系统会自动回退到**基于关键词规则的本地清洗**，当天线索不会丢失；同一来源的线索会按 `sent_cache.json` 历史去重，避免重复推送。定向搜索、邮箱提取、意向评分与开发信均为纯本地逻辑（无需 API），即使零额度也能完整产出。
 
 ## 项目结构
 
@@ -112,6 +116,9 @@ python main.py
 | `OPENAI_MODEL` | `gpt-4o-mini` | 使用的模型名 |
 | `HISTORY_FILE` | `sent_cache.json` | 已推送线索历史缓存文件路径 |
 | `HISTORY_MAX` | `2000` | 历史缓存保留的最大条目数（超出后从最早开始淘汰） |
+| `DIRECTORY_SEARCH` | `1` | 是否开启垂直黄页 / 专业社区定向搜索（`site:` 限制）。`0` 关闭，仅做普通全网搜索 |
+| `DIRECTORY_SITES` | `thomasnet.com,kompass.com,reddit.com/r/manufacturing,engineering.com,globalspec.com` | 定向搜索的站点白名单（逗号分隔）。系统会把关键词与这些站点轮询配对，生成 `关键词 site:站点` 查询，精准捕获黄页 / 社区的高价值线索 |
+| `DIRECTORY_MAX_QUERIES` | `12` | 定向搜索（site:）生成的最大查询数量，用于控制额外请求量 |
 
 ### 本地调试示例（含新增配置项）
 
