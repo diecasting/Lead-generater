@@ -10,7 +10,9 @@ Daily Lead Collector — CNC / Die Casting / Casting / Plastic Injection Molding
 
 流程：
   1. 多关键词搜索（Bing Web Search API，未配置 Key 时回退到 DuckDuckGo 公开搜索）
-     —— 关键词采用分类矩阵（压铸/模具、CNC/精密加工、外贸/代工买家），
+     —— 关键词采用「买方意图」分类矩阵（压铸/铸造买家、塑胶注塑买家、
+        CNC 精密加工买家、外包/OEM-ODM 采购买家），全部从采购方视角撰写
+        （looking for / seeking / need / outsourcing / RFQ），而非供应商自广告；
         支持 SEARCH_COMBINE 组合长尾查询，单次覆盖更多维度与原始线索
   2. 优先调用大模型 API 清洗、过滤垃圾信息；遇 429 / 超时 / 无额度时自动
      指数退避重试，并回退到本地规则清洗，确保不丢线索
@@ -52,56 +54,79 @@ except ImportError:
 # 配置（全部来自环境变量 / GitHub Secrets）
 # ---------------------------------------------------------------------------
 
-# 目标行业关键词矩阵（分门别类，可自行增减）。单次运行会遍历全部关键词，
-# 大幅提升覆盖维度与原始线索数量。
+# 目标行业关键词矩阵 —— 全部从「买家 / 采购方」视角撰写（关键！）
+# 旧的矩阵混入了大量「供应商自广告」视角的关键词（如 "mold maker RFQ China"、
+# "CNC machining contract manufacturer"、"buyer seeking factory CNC"），导致搜索
+# 结果回灌进来的全是同行压铸/加工工厂。这里一律改写为「正在寻找 / 外包 / 询盘」
+# 的买方措辞（looking for / seeking / need / want to source / outsourcing / RFQ /
+# sourcing inquiry / buyer），即使句中带有 supplier / manufacturer，也只作为
+# 「买家要找的对象」，而非供应商自己在吆喝。
 KEYWORD_GROUPS = {
-    "压铸与模具类": [
-        "aluminum die casting RFQ",
-        "zinc die casting supplier inquiry",
-        "custom plastic mold RFQ",
-        "injection molding buyer request",
-        "die casting parts buyer",
-        "die casting tooling RFQ",
-        "magnesium die casting inquiry",
-        "plastic injection mold maker wanted",
-        "mold maker RFQ China",
-        "die casting company looking for supplier",
+    # 压铸 / 铸造 买家（寻找压铸/铸造外包的采购方）
+    "压铸与铸造买家": [
+        "looking for die casting supplier",
+        "need custom aluminum die casting parts",
+        "aluminum die casting RFQ buyer",
+        "request for quote die casting",
+        "outsourcing die casting production",
+        "seeking zinc die casting manufacturer",
+        "custom product development die casting buyer",
+        "want to source die cast components",
+        "sand casting buyer inquiry",
+        "aluminum die casting sourcing inquiry",
     ],
-    "CNC与精密加工类": [
-        "CNC machining parts RFQ",
-        "precision machining buyer inquiry",
-        "custom metal fabrication sourcing",
-        "OEM CNC milling RFQ",
-        "5 axis CNC machining RFQ",
-        "CNC turning parts buyer",
-        "machined aluminum parts inquiry",
-        "precision components sourcing agent",
-        "CNC machining contract manufacturer",
+    # 塑胶模具 / 注塑 买家
+    "塑胶模具与注塑买家": [
+        "OEM plastic mold RFQ",
+        "looking for injection molding supplier",
+        "need custom plastic parts molded",
+        "seeking plastic injection mold maker",
+        "plastic injection molding buyer inquiry",
+        "outsource plastic molding production",
+        "custom plastic product development buyer",
+        "request quotes injection molded parts",
+        "molder wanted plastic components",
+        "injection molding sourcing agent",
+    ],
+    # CNC / 精密加工 买家
+    "CNC与精密加工买家": [
+        "contract manufacturing partner machining",
+        "seeking CNC machining supplier",
+        "need custom CNC machined parts",
+        "CNC machining RFQ buyer",
+        "looking for precision machining partner",
+        "outsource CNC machining production",
+        "custom CNC parts sourcing inquiry",
+        "5 axis machining buyer request",
         "rapid prototyping machining RFQ",
+        "OEM CNC milling buyer",
     ],
-    "外贸与代工买家类": [
-        "looking for manufacturing factory China",
-        "contract manufacturing RFQ",
+    # 外包 / OEM-ODM / 产品开发 采购买家
+    "外包与OEM_ODM采购买家": [
+        "outsourcing metal casting production",
+        "contract manufacturing partner wanted",
+        "OEM ODM inquiry custom parts",
+        "looking for manufacturing partner China",
         "metal parts sourcing agent buyer",
-        "OEM ODM supplier inquiry",
-        "outsource manufacturing RFQ",
-        "find supplier for metal parts",
-        "manufacturing partner wanted",
-        "buyer seeking factory CNC",
-        "import metal components inquiry",
-        "distributor looking for manufacturer",
+        "product development company seeking supplier",
+        "buyer seeking custom manufacturer",
+        "import metal components inquiry buyer",
+        "distributor looking for custom parts",
+        "engineering company sourcing machined parts",
     ],
 }
 
-# 组合搜索：将「工艺词」与「采购意图词」交叉，生成更多长尾查询
+# 组合搜索：将「工艺/材质词」与「买方意图词」交叉，生成更多长尾查询
 # （默认关闭，通过 SEARCH_COMBINE=1 开启；组合数量受 SEARCH_COMBINE_MAX 限制）
+# 注意：INTENT 侧一律使用买方动词，绝不使用 "supplier"/"factory" 作为主语去吆喝。
 COMBINE_PROCESS = [
     "aluminum die casting", "zinc die casting", "CNC machining",
-    "plastic injection molding", "precision machining", "metal stamping",
+    "plastic injection molding", "precision machining", "metal casting",
 ]
 COMBINE_INTENT = [
-    "RFQ", "buyer inquiry", "supplier wanted", "sourcing request",
-    "OEM ODM inquiry", "contract manufacturer wanted",
+    "looking for supplier", "RFQ", "buyer inquiry", "request for quote",
+    "sourcing request", "seeking manufacturer", "contract manufacturing partner",
+    "need custom parts", "outsourcing production", "OEM ODM inquiry",
 ]
 
 
@@ -358,12 +383,23 @@ SYSTEM_PROMPT = (
     "manufacturing company (CNC machining, aluminum die casting, sand/gravity "
     "casting, and plastic injection molding). You receive raw search results "
     "that may include RFQs, buyer inquiries, sourcing posts, marketplace "
-    "listings, and a lot of irrelevant noise (news, definitions, tutorials, "
-    "supplier self-advertising, job posts). "
-    "Filter STRICTLY to items that look like REAL buying intent from a "
-    "potential customer/buyer (a company or individual actively seeking quotes, "
-    "suppliers, or custom parts). Discard pure suppliers advertising themselves, "
-    "generic articles, and spam. "
+    "listings — and a LOT of noise: supplier self-advertising (competitor "
+    "factories/molders/foundries promoting their own capabilities), news, "
+    "tutorials, and spam. "
+    "CRITICAL — keep ONLY real buying intent from the BUYER side: "
+    "  - a company / brand owner / purchasing manager / product-development "
+    "firm actively LOOKING FOR or SOURCING a supplier, quoting, or outsourcing "
+    "production. "
+    "STRICTLY DISCARD: "
+    "  - any page that is a supplier advertising itself (phrases like "
+    "'we are a manufacturer', 'our foundry', 'casting capabilities', "
+    "'machining services provider', 'injection molding supplier', "
+    "'ISO certified factory', 'custom manufacturing solutions', etc.) — these "
+    "are COMPETITORS, not leads; "
+    "  - generic articles, tutorials, job posts, and spam. "
+    "PRIORITIZE results containing explicit buyer-intent language: "
+    "'We are looking for...', 'Our company needs...', 'Requesting quotes for...', "
+    "'Looking to source...', 'seeking a supplier', RFQ / request-for-quote. "
     "Return ONLY valid JSON of the form:\n"
     '{"leads": [{"company": str, "need_summary": str, "source_url": str, '
     '"keyword": str, "confidence": "high"|"medium"|"low"}]}\n'
@@ -377,8 +413,17 @@ SYSTEM_PROMPT = (
 # ---------------------------------------------------------------------------
 # 规则清洗（确定性、零依赖；OpenAI 额度不足 / 网络不通时自动回退）
 # ---------------------------------------------------------------------------
-# 购买意图信号（强）
+# 购买意图信号（强）—— 优先匹配「买家亲口说出」的询盘/采购措辞
 BUY_SIGNALS = [
+    # 强买方意图短语（出现即可判定为真实买家在找供应商）
+    (r"we (?:are|'re) looking for", 5),
+    (r"our company (?:needs|is looking for|requires|is seeking)", 5),
+    (r"looking to (?:source|outsource|procure|find|partner)", 4),
+    (r"seeking (?:a |an )?(?:supplier|manufacturer|quote|partner|vendor)", 4),
+    (r"requesting (?:a |quotes|quote|quotation)", 4),
+    (r"need to source|interested in sourcing|help (?:us|me) find", 4),
+    (r"we want to (?:produce|source)|planning to (?:produce|source|outsource)", 3),
+    # 通用询价/采购意图
     (r"\brfq\b|request for quote", 4),
     (r"inquir|enquir", 3),
     (r"\bbuyer\b", 3),
@@ -393,20 +438,35 @@ DOMAIN_SIGNALS = [
     (r"supplier|manufacturer|factory", 1),
     (r"casting|die[- ]?cast|\bcnc\b|machin|mold|mould|injection", 1),
 ]
-# 供应商自广告（减分）
+# 供应商自广告（减分）—— 仅匹配「供应商在吆喝」的措辞，避免误伤真实买家
+# （买家常说 "we are looking for" / "our company needs"，这些不算自广告）
 AD_SIGNALS = [
-    (r"we (are|provide|offer|supply)\b", 1),
-    (r"leading (supplier|manufacturer)", 1),
-    (r"our company|contact us|get a quote", 1),
+    (r"we (?:provide|offer|supply|manufacture|produce)\b", 1),
+    (r"leading (?:supplier|manufacturer|foundry)", 1),
+    (r"our company (?:provides|offers|supplies|is a|manufactures)", 1),
+    (r"contact us|get a quote", 1),
 ]
 # 纯噪声（新闻 / 教程 / 招聘）
 NOISE_SIGNALS = [
     (r"news|article|tutorial|how[- ]to|wiki|definition", 2),
     (r"job|salary|career|hiring|vacancy", 2),
 ]
-# 来自「RFQ / 询价类」搜索关键词的天然购买意图，给基础分
+# 来自「买方意图类」搜索关键词的天然购买意图，给基础分
 KW_BUY_BONUS = 2
-KW_BUY_RE = re.compile(r"rfq|inquir|buyer|sourc|request for quote", re.I)
+KW_BUY_RE = re.compile(
+    r"rfq|inquir|buyer|sourc|request for quote|looking for|seeking|"
+    r"outsourc|contract manufacturing|oem|odm|need custom|buyer request|"
+    r"want to source",
+    re.I,
+)
+# 强买方意图正则（命中即视为高质量买家，额外加分并提升置信度）
+BUYER_INTENT_RE = re.compile(
+    r"we (?:are|'re) looking for|our company (?:needs|is looking for|requires)|"
+    r"looking to source|looking to outsource|requesting (?:a )?quote|"
+    r"seeking a supplier|need to source|interested in sourcing|"
+    r"help (?:us|me) find a supplier",
+    re.I,
+)
 RULE_MIN_SCORE = 3
 
 
@@ -446,6 +506,10 @@ def clean_with_rules(raw_results):
 
         blob = f"{r.get('title','')} {r.get('snippet','')} {r.get('keyword','')}".lower()
 
+        # 同行 / 供应商自广告硬过滤：命中即剔除，绝不把竞争对手当线索输出
+        if is_competitor(url, r.get("title", ""), r.get("snippet", "")):
+            continue
+
         def _sum(patterns):
             return sum(w for pat, w in patterns if re.search(pat, blob))
 
@@ -454,11 +518,17 @@ def clean_with_rules(raw_results):
         noise = _sum(NOISE_SIGNALS)
         # 搜索关键词本身含购买意图时加基础分（搜索已定向到买家）
         kw_bonus = KW_BUY_BONUS if KW_BUY_RE.search(r.get("keyword", "")) else 0
-        score = buy + _sum(DOMAIN_SIGNALS) + kw_bonus - ad - noise
+        # 强买方意图短语：额外加分，凸显真实询盘
+        buyer_intent = bool(BUYER_INTENT_RE.search(blob))
+        score = (buy + _sum(DOMAIN_SIGNALS) + kw_bonus
+                 + (5 if buyer_intent else 0) - ad - noise)
 
         # 判定合格：有购买意图、非供应商自广告、非纯噪声
         if buy >= 2 and ad < 2 and noise == 0 and score >= RULE_MIN_SCORE:
-            conf = "high" if score >= 8 else ("medium" if score >= 5 else "low")
+            # 命中强买方意图直接拉高置信度，确保真实买家排到前面
+            base_conf = "high" if score >= 8 else ("medium" if score >= 5 else "low")
+            conf = ("high" if (buyer_intent and base_conf in ("high", "medium"))
+                    else base_conf)
             scored.append({
                 "company": extract_company_name(r.get("title"), r.get("url"), r.get("snippet")),
                 "need_summary": (r.get("snippet") or r.get("title") or "")[:160],
@@ -725,6 +795,71 @@ def filter_blacklist(raw_results):
         kept.append(r)
     if dropped:
         print(f"[filter] 已过滤 {dropped} 条垃圾/内容站点结果。", file=sys.stderr)
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# 同行过滤（Anti-Competitor / Negative Filtering）
+# ---------------------------------------------------------------------------
+# 以下短语天然是「供应商在推销自己」，与我们要找的买家完全相反；命中即判定为
+# 同行 / 无效页面，在清洗阶段直接剔除。只保留正在寻源、询盘、外包或发布采购
+# 需求的买家（Buyer）、品牌商（Brand owner）、采购经理（Purchasing manager）
+# 或产品开发公司（Product development company）。
+COMPETITOR_HARD_PHRASES = (
+    "we are a manufacturer", "we are an oem", "we are a supplier",
+    "we are a foundry", "we're a manufacturer", "we are a precision",
+    "our foundry", "our factory", "our own factory",
+    "our manufacturing facility", "our production facility",
+    "casting capabilities", "machining services provider",
+    "injection molding supplier", "iso certified factory",
+    "iso certified manufacturer", "custom manufacturing solutions",
+    "we provide manufacturing services", "we specialize in manufacturing",
+    "precision manufacturer since", "leading manufacturer of",
+    "leading supplier of", "leading foundry", "one-stop manufacturing",
+    "turnkey manufacturing", "we offer die casting",
+    "we offer cnc machining", "we offer injection molding",
+    "our capabilities include", "welcome to our factory",
+)
+# 高精度的「自广告主语 + 供应商名词」正则：必须出现 we/our + 供应商名词，
+# 且中间不夹带 looking for / seeking / need 等买方动词，避免误杀真实买家。
+COMPETITOR_REGEX = re.compile(
+    r"(?:"
+    r"we (?:are|'re) (?:a|an|the) (?:leading |precision |professional |global |"
+    r"reliable |trusted |top )*(?:manufacturer|supplier|factory|foundry|molder|"
+    r"machine shop|producer|fabricator)\b"
+    r"|our (?:own )?(?:foundry|factory|facility|plant|workshop|tooling|machine shop)\b"
+    r"|(?:cnc |die ?casting |injection molding |metal )?(?:machining|casting|"
+    r"molding|stamping) services (?:provider|company|supplier)\b"
+    r")",
+    re.I,
+)
+
+
+def is_competitor(url="", title="", snippet=""):
+    """判定一条结果是否属于同行供应商自广告（而非真实买家）。
+
+    命中即视为无效 / 同行页面，应在清洗阶段剔除，只保留正在寻源、询盘、
+    外包或发布采购需求的买家（Buyer）、品牌商、采购经理或产品开发公司。
+    同时扫描标题、摘要与 URL，覆盖「标题 / URL / 正文」三种特征来源。
+    """
+    text = f"{title} {snippet} {url}".lower()
+    if any(p in text for p in COMPETITOR_HARD_PHRASES):
+        return True
+    if COMPETITOR_REGEX.search(text):
+        return True
+    return False
+
+
+def filter_competitors(raw_results):
+    """过滤掉同行供应商自广告页面，仅保留潜在真实买家线索。"""
+    kept, dropped = [], 0
+    for r in raw_results:
+        if is_competitor(r.get("url", ""), r.get("title", ""), r.get("snippet", "")):
+            dropped += 1
+            continue
+        kept.append(r)
+    if dropped:
+        print(f"[filter] 已过滤 {dropped} 条同行/供应商自广告结果。", file=sys.stderr)
     return kept
 
 
@@ -1105,6 +1240,8 @@ def main():
 
     # 黑名单过滤：剔除知乎/维基/博客/中介广告等垃圾站点，只留真实买家
     raw = filter_blacklist(raw)
+    # 同行过滤：剔除压铸/加工/注塑等同行业工厂的自广告页面（竞争对手，非买家）
+    raw = filter_competitors(raw)
     print(f"==> 过滤后剩余 {len(raw)} 条待清洗原始结果。")
 
     print("==> 调用 AI 清洗与过滤 ...")

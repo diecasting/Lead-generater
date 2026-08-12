@@ -50,11 +50,11 @@ def test_extract_emails_from_html_mailto_and_text():
 
 def test_get_search_keywords_expanded_and_deduped():
     kws = main.get_search_keywords()
-    # at least the 30 base keywords across 3 groups
+    # 4 个买方视角分组共 40 个关键词（已全部改写为买家/采购方措辞）
     assert len(kws) >= 30
-    assert "aluminum die casting RFQ" in kws
-    assert "CNC machining parts RFQ" in kws
-    assert "OEM ODM supplier inquiry" in kws
+    assert "aluminum die casting RFQ buyer" in kws
+    assert "CNC machining RFQ buyer" in kws
+    assert "OEM ODM inquiry custom parts" in kws
     assert len(kws) == len(set(kws)), "keywords must be de-duplicated"
 
 
