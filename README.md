@@ -25,7 +25,7 @@ GitHub Actions (每天 UTC 00:00 / 北京 08:00)
         ├─► 4. 网页邮箱提取 + 意向评分(0-100) + 个性化英文开发信
         │
         └─► 5. 邮件推送（按意向分排序、🔥/⚡ 等级标签、含开发信草稿）
-               经 SMTP (SSL 或 STARTTLS) 发送至 Hank@alumcasting.com
+               经 SMTP (SSL 或 STARTTLS) 发送至 alumcastor@gmail.com
 ```
 
 > 说明：若 `OPENAI_API_KEY` 未配置、额度不足（429）或网络异常，系统会自动回退到**基于关键词规则的本地清洗**，当天线索不会丢失；同一来源的线索会按 `sent_cache.json` 历史去重，避免重复推送。定向搜索、邮箱提取、意向评分与开发信均为纯本地逻辑（无需 API），即使零额度也能完整产出。
@@ -56,7 +56,7 @@ export MAIL_SERVER="smtp.gmail.com"
 export MAIL_PORT="465"
 export MAIL_USERNAME="you@example.com"
 export MAIL_PASSWORD="your_app_password"
-export MAIL_RECIPIENT="Hank@alumcasting.com"
+export MAIL_RECIPIENT="alumcastor@gmail.com"
 # 可选：export BING_API_KEY="..."   # 不设置则使用 DuckDuckGo 回退
 
 python main.py
@@ -76,14 +76,14 @@ python main.py
 | `MAIL_PORT` | ✅ | SMTP SSL 端口，通常为 `465` |
 | `MAIL_USERNAME` | ✅ | 发件邮箱账号 |
 | `MAIL_PASSWORD` | ✅ | 发件邮箱密码 / **应用专用密码**（见下方说明） |
-| `MAIL_RECIPIENT` | ⬜ | 收件人，默认 `Hank@alumcasting.com` |
+| `MAIL_RECIPIENT` | ⬜ | 收件人，默认 `alumcastor@gmail.com` |
 | `MAIL_SENDER` | ⬜ | 发件人显示名对应的邮箱，默认等于 `MAIL_USERNAME` |
 
 > 兼容性说明：配置校验时 `MAIL_SERVER` 等价于 `MAIL_HOST`、`MAIL_USERNAME` 等价于 `MAIL_USER`，两套命名均可被识别，不影响运行。
 
 ### 关于邮箱密码的重要提示
 
-- **Gmail**：不能使用普通登录密码，需在 Google 账号 → 安全 → 开启两步验证 → 生成 **App Password（应用专用密码）**，填到 `MAIL_PASSWORD`。
+- **Gmail**：不能使用普通登录密码，需在 Google 账号 → 安全 → 开启两步验证 → 生成 **App Password（应用专用密码）**，填到 `MAIL_PASSWORD`。Gmail 要求发件 `From` 与登录账号完全一致，脚本已自动把 `From` 对齐到 `MAIL_USERNAME`（即 `alumcastor@gmail.com`）；**请勿在 `MAIL_SENDER` 中填写与登录账号不同的地址**，否则会被 Gmail 拒绝（5.7.1 SendAsDenied）。只需把 `MAIL_USERNAME` / `MAIL_PASSWORD`（`MAIL_SERVER` 填 `smtp.gmail.com`、`MAIL_PORT` 填 `465`）配置为 Gmail 应用专用密码即可正常发信。
 - **企业邮箱（如腾讯企业邮 / 阿里邮箱 / SiteGround / Outlook）**：填写对应的 SMTP 地址与授权码。常见地址：
   - 腾讯企业邮：`smtp.exmail.qq.com`，端口 `465`
   - SiteGround 企业邮：`sgp14.siteground.asia`，端口 `587`（脚本已内置 STARTTLS 支持）
@@ -130,7 +130,7 @@ export MAIL_SERVER="sgp14.siteground.asia"
 export MAIL_PORT="587"
 export MAIL_USERNAME="you@your-domain.com"
 export MAIL_PASSWORD="your_mail_auth_code"
-export MAIL_RECIPIENT="Hank@alumcasting.com"
+export MAIL_RECIPIENT="alumcastor@gmail.com"
 
 # 可选：开启组合搜索 + 调整线索上限
 export SEARCH_COMBINE=1

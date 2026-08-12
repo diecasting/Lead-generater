@@ -39,6 +39,7 @@ import socket
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formataddr
 from urllib.parse import urlparse, parse_qs
 
 import requests
@@ -993,7 +994,7 @@ def generate_cold_email(lead):
         f"Best regards,\n"
         f"Hank\n"
         f"AlumCasting — Precision Manufacturing\n"
-        f"Email: Hank@alumcasting.com"
+        f"Email: alumcastor@gmail.com"
     )
 
 
@@ -1162,8 +1163,18 @@ def send_email(subject, html):
     port = int(cfg("MAIL_PORT", "465"))
     username = _first_set(MAIL_USER_ALIASES)
     password = cfg("MAIL_PASSWORD")
-    recipient = cfg("MAIL_RECIPIENT", "Hank@alumcasting.com")
-    sender = cfg("MAIL_SENDER") or username
+    recipient = cfg("MAIL_RECIPIENT", "alumcastor@gmail.com")
+
+    # Gmail（及多数邮件服务商）要求信封/信件 From 必须等于认证账户本身，
+    # 否则会报 5.7.1 SendAsDenied（地址不匹配）。因此发件人默认对齐到登录账号；
+    # 若显式配置了 MAIL_SENDER，仅当它等于登录账号时才生效，否则告警并回退到
+    # 登录账号，避免 GitHub Actions 用 Gmail 应用专用密码发信时出现校验/发送报错。
+    sender_env = cfg("MAIL_SENDER")
+    sender = (sender_env or username or "").strip()
+    if sender_env and username and sender_env.strip().lower() != username.strip().lower():
+        print("[mail][WARN] MAIL_SENDER 与登录账号不一致；Gmail 会强制改写为登录账号，"
+              "已自动对齐到发件账号以避免 SendAsDenied 错误。", file=sys.stderr)
+        sender = username
 
     if not (server and username and password):
         print("[mail] SMTP 凭据不完整；跳过发送，仅本地保存 HTML。",
@@ -1172,7 +1183,7 @@ def send_email(subject, html):
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = sender
+    msg["From"] = formataddr(("AlumCasting Leads", sender)) if sender else ""
     msg["To"] = recipient
     msg.attach(MIMEText(html, "html", "utf-8"))
 

@@ -190,3 +190,67 @@ def test_rule_cleaner_boosts_buyer_intent():
     leads = main.clean_with_rules(raw)
     assert len(leads) == 1
     assert leads[0]["confidence"] == "high"
+
+
+# ---------------------------------------------------------------------------
+# 7. 邮件发件人 / 收件人对齐（Gmail 安全）
+# ---------------------------------------------------------------------------
+
+def _patch_smtp(monkeypatch):
+    import smtplib as _smtp
+
+    captured = {}
+
+    class FakeSMTP:
+        def __init__(self, *a, **k):
+            captured.setdefault("inits", []).append((a, k))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def login(self, user, pw):
+            captured["user"] = user
+
+        def send_message(self, msg):
+            captured["msg"] = msg
+
+    monkeypatch.setattr(_smtp, "SMTP_SSL", FakeSMTP)
+    monkeypatch.setattr(_smtp, "SMTP", FakeSMTP)
+    return captured
+
+
+def test_send_email_defaults_align_to_gmail(monkeypatch):
+    """默认收件人应为 alumcastor@gmail.com；From 必须对齐到登录账号，
+    避免 Gmail SendAsDenied（5.7.1）。"""
+    captured = _patch_smtp(monkeypatch)
+    monkeypatch.setenv("MAIL_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("MAIL_PORT", "465")
+    monkeypatch.setenv("MAIL_USER", "alumcastor@gmail.com")
+    monkeypatch.setenv("MAIL_PASSWORD", "apppass16char")
+    # 不设置 MAIL_RECIPIENT / MAIL_SENDER，验证默认值与对齐逻辑
+
+    ok = main.send_email("Test", "<p>hi</p>")
+    assert ok is True
+    assert captured["user"] == "alumcastor@gmail.com"
+    msg = captured["msg"]
+    assert "alumcastor@gmail.com" in msg["From"]      # From 地址对齐登录账号
+    assert msg["To"] == "alumcastor@gmail.com"         # 默认收件人
+
+
+def test_send_email_sender_falls_back_when_mismatched(monkeypatch):
+    """MAIL_SENDER 与登录账号不一致时，应从告警并回退到登录账号。"""
+    captured = _patch_smtp(monkeypatch)
+    monkeypatch.setenv("MAIL_HOST", "smtp.gmail.com")
+    monkeypatch.setenv("MAIL_PORT", "465")
+    monkeypatch.setenv("MAIL_USER", "alumcastor@gmail.com")
+    monkeypatch.setenv("MAIL_PASSWORD", "apppass16char")
+    monkeypatch.setenv("MAIL_SENDER", "someone-else@hotmail.com")
+
+    ok = main.send_email("Test", "<p>hi</p>")
+    assert ok is True
+    # From 已回退到登录账号，不得保留不一致的 MAIL_SENDER
+    assert "alumcastor@gmail.com" in captured["msg"]["From"]
+    assert "someone-else@hotmail.com" not in captured["msg"]["From"]
