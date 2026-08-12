@@ -254,3 +254,80 @@ def test_send_email_sender_falls_back_when_mismatched(monkeypatch):
     # From 已回退到登录账号，不得保留不一致的 MAIL_SENDER
     assert "alumcastor@gmail.com" in captured["msg"]["From"]
     assert "someone-else@hotmail.com" not in captured["msg"]["From"]
+
+
+# ---------------------------------------------------------------------------
+# 8. 反同行邮箱识别 + 严格买方意图闸门
+# ---------------------------------------------------------------------------
+
+def test_is_competitor_email_strong_tokens():
+    # 同行供应商联络邮箱（前缀或域名暴露制造/加工身份）
+    assert main.is_competitor_email("yongzhucasting@163.com") is True
+    assert main.is_competitor_email("sales@abc-machining.com") is True
+    assert main.is_competitor_email("info@xyz-foundry.com") is True
+    assert main.is_competitor_email("contact@bestmold.com") is True
+    assert main.is_competitor_email("cncpro@toolingworks.com") is True
+
+
+def test_is_competitor_email_keeps_real_buyer():
+    # 真实买家品牌邮箱不应被误杀
+    assert main.is_competitor_email("john@brandco.com") is False
+    assert main.is_competitor_email("info@acmebuyer.com") is False
+    assert main.is_competitor_email("procurement@bigretailer.com") is False
+
+
+def test_is_competitor_email_free_domain_not_flagged_by_weak():
+    # 弱信号仅在非免费域名生效；免费邮箱不误伤（tech 等泛词不应杀买家）
+    assert main.is_competitor_email("acmetech@gmail.com") is False
+
+
+def test_filter_competitor_emails_drops_all_competitor_lead():
+    leads = [
+        {"source_url": "https://x.com", "emails": ["yongzhucasting@163.com"],
+         "need_summary": "we are a foundry", "confidence": "low"},
+        {"source_url": "https://buyer.com", "emails": ["buyer@brandco.com"],
+         "need_summary": "looking for supplier", "confidence": "high"},
+        {"source_url": "https://mix.com",
+         "emails": ["sales@abc-machining.com", "buyer@brandco.com"],
+         "need_summary": "RFQ", "confidence": "medium"},
+    ]
+    kept = main.filter_competitor_emails(leads)
+    urls = {l["source_url"] for l in kept}
+    assert "https://x.com" not in urls          # 全部为同行邮箱 -> 丢弃整条
+    assert "https://buyer.com" in urls
+    mix = next(l for l in kept if l["source_url"] == "https://mix.com")
+    assert mix["emails"] == ["buyer@brandco.com"]  # 剔除同行邮箱，保留买家邮箱
+
+
+def test_rule_cleaner_drops_non_buyer_snippet():
+    # 没有买方动作、也没有 RFQ/图纸的制造类描述 -> 不入库
+    raw = [{
+        "title": "Custom aluminum casting manufacturer",
+        "snippet": "we are a precision manufacturer of die casting parts",
+        "keyword": "looking for die casting supplier",
+        "url": "https://supplier.com",
+    }]
+    assert main.clean_with_rules(raw) == []
+
+
+def test_rule_cleaner_drops_inbound_quote_competitor():
+    # 供应商邀请别人向自己询价 -> 视为同行，不入库
+    # （同时验证 TRUE_BUYER_RE 不会误把 "request a quote from us" 当买家动作）
+    raw = [{
+        "title": "Get a quote from us",
+        "snippet": "request a quote from us for your machining project",
+        "keyword": "seeking CNC machining supplier",
+        "url": "https://supplier.com",
+    }]
+    assert main.clean_with_rules(raw) == []
+
+
+def test_rule_cleaner_keeps_genuine_rfq_buyer():
+    raw = [{
+        "title": "Company X RFQ",
+        "snippet": "request for quote on custom aluminum die casting, drawing attached",
+        "keyword": "looking for die casting supplier",
+        "url": "https://buyer.com/rfq",
+    }]
+    leads = main.clean_with_rules(raw)
+    assert len(leads) == 1

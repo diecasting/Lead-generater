@@ -393,11 +393,21 @@ SYSTEM_PROMPT = (
     "production. "
     "STRICTLY DISCARD: "
     "  - any page that is a supplier advertising itself (phrases like "
-    "'we are a manufacturer', 'our foundry', 'casting capabilities', "
-    "'machining services provider', 'injection molding supplier', "
-    "'ISO certified factory', 'custom manufacturing solutions', etc.) — these "
-    "are COMPETITORS, not leads; "
+    "'we are a manufacturer', 'our foundry', 'we specialize in', 'we manufacture', "
+    "'casting capabilities', 'machining services provider', 'injection molding "
+    "supplier', 'ISO certified factory', 'custom manufacturing solutions', "
+    "'our capabilities', etc.) — these are COMPETITORS, not leads; "
+    "  - any page whose contact email reveals a competitor (local part or domain "
+    "contains casting / foundry / machining / molding / tooling / cnc / parts / "
+    "factory / supplier, e.g. 'yongzhucasting@...', 'sales@abc-machining.com'); "
+    "  - supplier pages that invite inbound quotes ('request a quote from us', "
+    "'get a quote from us') — that means THEY want to be hired, not that they "
+    "are buying; "
     "  - generic articles, tutorials, job posts, and spam. "
+    "Only KEEP a result if it is clearly a BUYER / brand owner / purchasing "
+    "manager / product-development firm actively LOOKING FOR or SOURCING a "
+    "supplier, requesting a quote (from a supplier), outsourcing production, or "
+    "posting a genuine RFQ (with RFQ number, drawings, or specs). "
     "PRIORITIZE results containing explicit buyer-intent language: "
     "'We are looking for...', 'Our company needs...', 'Requesting quotes for...', "
     "'Looking to source...', 'seeking a supplier', RFQ / request-for-quote. "
@@ -469,6 +479,41 @@ BUYER_INTENT_RE = re.compile(
     re.I,
 )
 RULE_MIN_SCORE = 3
+# 真·买方意图（True Buyer Intent）：页面是「买家在说话」——明确发出采购 / 寻源 /
+# 外包动作。命中其一即可判定为终端买家 / 外包商 / 品牌商 / 采购方，而非供应商自广告。
+TRUE_BUYER_RE = re.compile(
+    r"we (?:are|'re) looking for|"                                       # we are looking for
+    r"looking for (?:a |an |our |the )?(?:supplier|manufacturer|quote|partner|"
+    r"vendor|factory|oem|odm|foundry|molder)\b|"                          # looking for a supplier
+    r"seeking (?:a |an |our |the )?(?:supplier|manufacturer|quote|partner|"
+    r"vendor|oem|odm|foundry)\b|"                                         # seeking a supplier
+    r"our (?:company|team|project|firm|organization) (?:needs|requires|"
+    r"is looking for|is seeking|needs to|wants to)|"                       # our company needs
+    r"our project requires|our team needs|"                               # 项目明确需要
+    r"we need (?:a |to |quote|supplier|manufacturer|partner)|"            # we need a quote / we need to source
+    r"need to (?:source|outsource|procure|order|purchase|buy|find|get)|"  # we need to outsource
+    r"request(?:ing)? (?:a |for )?(?:quote|quotation)(?! from)|"        # requesting a quote（排除 "from us" 这类供应商反向邀约）
+    r"request for (?:quote|quotation)|"                                   # request for quote
+    r"help (?:us|me) (?:find|source|get|obtain) (?:a |an )?"
+    r"(?:supplier|quote|manufacturer|partner)|"                           # help us find a supplier
+    r"looking to (?:source|outsource|procure|partner|buy|order|find)|"    # looking to source
+    r"we want to (?:source|outsource|procure|order|buy|find|partner)|"    # we want to source
+    r"wish to (?:purchase|buy|source|procure)|"                           # wish to purchase
+    r"interested in (?:purchasing|buying|sourcing|procuring)|"            # interested in purchasing
+    r"in need of|sourcing (?:for|a |the )|"                               # in need of / sourcing for
+    r"procurement|tender|bid (?:for|request)|"                            # procurement / tender
+    r"buy (?:from|the|these)|purchase (?:from|order)|"                    # buy from
+    r"quote request|quotation request",                                   # quote / rfq
+    re.I,
+)
+# 采购平台 / 黄页上的真实求购贴信号：RFQ 标识、图纸 / 规格需求（非制造企业发出的
+# 组装 / 设计需求）。用于放行那些没有显式买方动词、但确实是求购贴的结果。
+RFQ_PLATFORM_RE = re.compile(
+    r"\brfq\b|request for quote|request for quotation|quotation request|"
+    r"quote request|rfq[#\s\-]?\d|"
+    r"(?:drawing|cad|step|iges|dxf|\bstp\b|blueprint|3d model|technical spec)\b",
+    re.I,
+)
 
 
 def _company_from_result(r):
@@ -524,8 +569,12 @@ def clean_with_rules(raw_results):
         score = (buy + _sum(DOMAIN_SIGNALS) + kw_bonus
                  + (5 if buyer_intent else 0) - ad - noise)
 
-        # 判定合格：有购买意图、非供应商自广告、非纯噪声
-        if buy >= 2 and ad < 2 and noise == 0 and score >= RULE_MIN_SCORE:
+        # 真·买方意图闸门：必须是「买家亲口说出」的采购/寻源/外包动作，
+        # 或是采购平台上的真实求购贴（RFQ / 图纸需求）；否则一律不入库，
+        # 从根本上杜绝把同行供应商自广告当线索输出。
+        true_buyer = bool(TRUE_BUYER_RE.search(blob))
+        rfq_platform = bool(RFQ_PLATFORM_RE.search(blob))
+        if (true_buyer or rfq_platform) and ad < 2 and noise == 0:
             # 命中强买方意图直接拉高置信度，确保真实买家排到前面
             base_conf = "high" if score >= 8 else ("medium" if score >= 5 else "low")
             conf = ("high" if (buyer_intent and base_conf in ("high", "medium"))
@@ -820,6 +869,14 @@ COMPETITOR_HARD_PHRASES = (
     "turnkey manufacturing", "we offer die casting",
     "we offer cnc machining", "we offer injection molding",
     "our capabilities include", "welcome to our factory",
+    # 新增：供应商在「邀请别人向自己询价」（区别于买家主动询盘）
+    "request a quote from us", "request quote from us",
+    "get a quote from us", "contact us for a quote", "ask us for a quote",
+    "request for quote from us",
+    # 新增：供应商自述特征（"我们生产 / 我们提供服务" 逻辑）
+    "we manufacture", "we fabricate", "we produce", "our capabilities",
+    "iso certified", "iso 9001", "iso9001", "our production line",
+    "we are equipped with", "our equipment includes",
 )
 # 高精度的「自广告主语 + 供应商名词」正则：必须出现 we/our + 供应商名词，
 # 且中间不夹带 looking for / seeking / need 等买方动词，避免误杀真实买家。
@@ -831,6 +888,14 @@ COMPETITOR_REGEX = re.compile(
     r"|our (?:own )?(?:foundry|factory|facility|plant|workshop|tooling|machine shop)\b"
     r"|(?:cnc |die ?casting |injection molding |metal )?(?:machining|casting|"
     r"molding|stamping) services (?:provider|company|supplier)\b"
+    # 供应商自述动词 + 制造名词（"我们生产/专做/提供…制造服务" 逻辑）
+    r"|we (?:specialize|manufacture|produce|fabricate) (?:in |our |the |a |an |and )?"
+    r"(?:manufactur|machin|cast|mold|mould|cnc|metal|precision|injection|"
+    r"production|fabricat|part|component|tooling|stamping)\b"
+    r"|we provide (?:our |the |a |an )?(?:manufactur|machin|cast|mold|cnc|"
+    r"production|fabricat) .{0,40}services\b"
+    # 供应商在邀请「别人向自己询价」（区别于买家主动 request for quote）
+    r"|request (?:a |us )?quote from us|get a quote from us|contact us for a quote"
     r")",
     re.I,
 )
@@ -861,6 +926,75 @@ def filter_competitors(raw_results):
         kept.append(r)
     if dropped:
         print(f"[filter] 已过滤 {dropped} 条同行/供应商自广告结果。", file=sys.stderr)
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# 同行邮箱识别（Anti-Competitor by Email）
+# ---------------------------------------------------------------------------
+# 同行供应商的联络邮箱，其前缀（local）或域名（domain）往往直接暴露制造/加工身份，
+# 例如 yongzhucasting@...、sales@abc-machining.com、info@xyz-foundry.com 等。
+# 这类邮箱一眼即可判定为同行，必须直接拦截，不能当作买家跟进邮箱。
+# 强信号：local 或 domain 含明确制造/加工词 -> 直接判定为同行；
+# 弱信号：仅 domain 含较泛的制造词，且不是免费/个人邮箱域名 -> 判定为同行
+#         （避免误伤 acmetech@gmail.com 这类普通买家邮箱）。
+COMPETITOR_EMAIL_STRONG = (
+    "casting", "foundry", "machining", "molding", "moulding", "tooling",
+    "diecast", "cnc", "fabricat", "stamping", "forging", "mold", "mould",
+    "mill", "lathe", "weld", "anodiz", "galvaniz", "extrud", "metalwork",
+)
+COMPETITOR_EMAIL_WEAK = (
+    "parts", "manufacturer", "factory", "supplier", "workshop",
+    "industry", "industrial", "machinery", "tech",
+)
+
+
+def is_competitor_email(email):
+    """判断一个邮箱是否属于同行供应商（而非真实买家）。命中即应在清洗阶段丢弃。"""
+    e = (email or "").strip().lower()
+    if "@" not in e:
+        return False
+    local, _, domain = e.rpartition("@")
+    if not local or not domain:
+        return False
+    # 强信号：前缀或域名含明确制造/加工词
+    if any(tok in local for tok in COMPETITOR_EMAIL_STRONG):
+        return True
+    if any(tok in domain for tok in COMPETITOR_EMAIL_STRONG):
+        return True
+    # 弱信号：仅当域名命中且不是免费/个人邮箱域名（降低误伤买家的概率）
+    if domain not in FREE_EMAIL_DOMAINS:
+        if any(tok in domain for tok in COMPETITOR_EMAIL_WEAK):
+            return True
+    return False
+
+
+def filter_competitor_emails(leads):
+    """邮箱提取之后调用：剔除线索中属于同行的联络邮箱；若一条线索提取到的
+    邮箱「全部」都是同行邮箱，则进一步判断——若正文本身已是明确的买方意图，
+    则只剔除同行邮箱、保留该线索（避免误杀真实买家）；若正文无法确认是买家，
+    则整页很可能就是同行自广告，直接丢弃。"""
+    kept, dropped = [], 0
+    for l in leads:
+        emails = l.get("emails") or []
+        non_comp = [e for e in emails if not is_competitor_email(e)]
+        if emails and not non_comp:
+            text = f"{l.get('need_summary','')} {l.get('keyword','')} " \
+                   f"{l.get('source_url','')}".lower()
+            if TRUE_BUYER_RE.search(text):
+                # 正文明确是买家，仅剔除同行邮箱，保留线索（可能无线索邮箱）
+                l["emails"] = []
+                kept.append(l)
+            else:
+                # 正文无法确认是买家 -> 整页很可能就是同行自广告，丢弃
+                dropped += 1
+                continue
+        else:
+            l["emails"] = non_comp
+            kept.append(l)
+    if dropped:
+        print(f"[filter] 已过滤 {dropped} 条「邮箱全为同行供应商且非买方正文」的线索。",
+              file=sys.stderr)
     return kept
 
 
@@ -1266,6 +1400,8 @@ def main():
 
     # 网页邮箱提取：为每条线索抓取并解析其来源页面中的联系邮箱
     leads = enrich_leads_with_emails(leads)
+    # 同行邮箱过滤：剔除同行供应商联络邮箱；若整页邮箱全是同行则丢弃该线索
+    leads = filter_competitor_emails(leads)
     total_emails = sum(len(l.get("emails") or []) for l in leads)
     print(f"==> 邮箱提取完成：共从 {len(leads)} 条线索中解析到 {total_emails} 个邮箱。")
 
