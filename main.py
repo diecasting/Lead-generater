@@ -177,6 +177,19 @@ HISTORY_MAX = int(os.getenv("HISTORY_MAX", "2000"))  # 防止缓存无限增长
 # 随运行次数永久收敛。默认 30 天，可经环境变量覆盖。
 DISCOVERY_DEDUP_TTL_DAYS = int(os.getenv("DISCOVERY_DEDUP_TTL_DAYS", "30"))
 
+# A2.1 — Bing 搜索时间窗（freshness）。仅影响配置了 BING_API_KEY 的 Bing 搜索路径；
+# DDG 回退路径不支持 freshness 参数，配置对其无效。默认值 "Week" 与改动前行为完全一致。
+# 允许值受 Bing Web Search v7 规范约束；非法值打印警告并回退到 "Week"，discovery 不崩溃。
+_ALLOWED_FRESHNESS = ("Day", "Week", "Month")
+DISCOVERY_SEARCH_FRESHNESS = os.getenv("DISCOVERY_SEARCH_FRESHNESS", "Week")
+if DISCOVERY_SEARCH_FRESHNESS not in _ALLOWED_FRESHNESS:
+    print(
+        f"[config][WARN] DISCOVERY_SEARCH_FRESHNESS="
+        f"{DISCOVERY_SEARCH_FRESHNESS!r} 非法，回退为 'Week'",
+        file=sys.stderr,
+    )
+    DISCOVERY_SEARCH_FRESHNESS = "Week"
+
 # 垂直黄页 / 专业社区定向搜索（site: 限制），可经环境变量覆盖
 DIRECTORY_SITES = [
     s.strip()
@@ -278,7 +291,7 @@ def bing_search(query, api_key, count=SEARCH_PER_KEYWORD):
         "q": query,
         "count": count,
         "mkt": "en-US",
-        "freshness": "Week",          # 只抓近期内容，更可能匹配近期 RFQ
+        "freshness": DISCOVERY_SEARCH_FRESHNESS,  # Bing 时间窗，默认 Week，可经 env 覆盖
         "textDecorations": False,
     }
     resp = requests.get(endpoint, headers=headers, params=params, timeout=25)

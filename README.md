@@ -117,6 +117,7 @@ python main.py
 | `HISTORY_FILE` | `sent_cache.json` | 已推送线索历史缓存文件路径 |
 | `HISTORY_MAX` | `2000` | 历史缓存保留的最大条目数（超出后按最近 `last_seen` 淘汰最旧条目） |
 | `DISCOVERY_DEDUP_TTL_DAYS` | `30` | 去重 TTL（天）。同一线索在 TTL 天内重复出现则去重；超过 TTL 允许重新进入 discovery pipeline（生命周期去重，替代原永久去重） |
+| `DISCOVERY_SEARCH_FRESHNESS` | `Week` | Bing 搜索时间窗（freshness）。允许值：`Day` / `Week` / `Month`。**仅作用于配置了 `BING_API_KEY` 的 Bing 搜索路径**；DDG 回退路径不支持 freshness 参数，配置对其无效。非法值会打印警告并回退到 `Week`，discovery 不会崩溃 |
 | `DIRECTORY_SEARCH` | `1` | 是否开启垂直黄页 / 专业社区定向搜索（`site:` 限制）。`0` 关闭，仅做普通全网搜索 |
 | `DIRECTORY_SITES` | `thomasnet.com,kompass.com,reddit.com/r/manufacturing,engineering.com,globalspec.com` | 定向搜索的站点白名单（逗号分隔）。系统会把关键词与这些站点轮询配对，生成 `关键词 site:站点` 查询，精准捕获黄页 / 社区的高价值线索 |
 | `DIRECTORY_MAX_QUERIES` | `12` | 定向搜索（site:）生成的最大查询数量，用于控制额外请求量 |
