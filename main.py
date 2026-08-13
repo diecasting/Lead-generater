@@ -172,6 +172,11 @@ RETRY_BASE_DELAY = int(os.getenv("AI_RETRY_BASE_DELAY", "3"))  # 秒
 HISTORY_FILE = os.getenv("HISTORY_FILE", "sent_cache.json")
 HISTORY_MAX = int(os.getenv("HISTORY_MAX", "2000"))  # 防止缓存无限增长
 
+# A1 — 去重 TTL（天）：同一线索在 TTL 天内重复出现则去重；超过 TTL 允许重新进入
+# discovery pipeline。把"永久去重"改造成"有生命周期的去重"，避免可推 Unique 空间
+# 随运行次数永久收敛。默认 30 天，可经环境变量覆盖。
+DISCOVERY_DEDUP_TTL_DAYS = int(os.getenv("DISCOVERY_DEDUP_TTL_DAYS", "30"))
+
 # 垂直黄页 / 专业社区定向搜索（site: 限制），可经环境变量覆盖
 DIRECTORY_SITES = [
     s.strip()
@@ -1066,45 +1071,151 @@ def build_html_report(leads, generated_at):
 
 
 # ---------------------------------------------------------------------------
-# 历史去重（防止重复推送同一线索）
+# 历史去重（A1：TTL 生命周期去重，替代原永久去重）
 # ---------------------------------------------------------------------------
 
-def load_sent_history(path=HISTORY_FILE):
-    """读取已推送线索 URL 集合；文件缺失 / 损坏时返回空集合。"""
+def _history_key(url):
+    """去重键：以线索原始 URL 为稳定键（与历史格式兼容），仅做空白归一化。
+
+    刻意不复用其它易碰撞的键——原系统即以 source_url 作为去重键，保持兼容。
+    """
+    return (url or "").strip()
+
+
+def _now_ts():
+    return time.time()
+
+
+def _entry_is_expired(entry, now, ttl_days):
+    """判断一条缓存记录是否已过 TTL（以 last_seen 为基准）。
+
+    边界约定：age >= TTL 即视为过期（允许重新发现）。
+    """
+    try:
+        last_seen = float(entry.get("last_seen", 0))
+    except (TypeError, ValueError):
+        return True
+    return (now - last_seen) >= ttl_days * 86400
+
+
+def prune_expired_entries(entries, ttl_days=DISCOVERY_DEDUP_TTL_DAYS, now=None):
+    """剔除超过 TTL 的缓存记录，返回仅含存活记录的 dict。
+
+    过期记录会被清理，从而不再阻塞对应线索重新进入 pipeline。
+    非 dict / 缺 last_seen / 非法时间戳的条目一律丢弃（容错，不崩溃）。
+    """
+    now = now if now is not None else _now_ts()
+    kept = {}
+    for k, v in entries.items():
+        if not isinstance(v, dict) or "last_seen" not in v:
+            continue
+        if _entry_is_expired(v, now, ttl_days):
+            continue
+        kept[k] = v
+    return kept
+
+
+def _migrate_legacy(data, now):
+    """把旧版缓存（list / {"urls": [...]}）迁移为 TTL 感知 entry dict。
+
+    旧 entry 视为 last_seen = 迁移时刻（reference time），使其获得一个全新的
+    TTL 窗口，而非立即过期或永久阻塞——既不破坏旧格式，也不清空整个缓存。
+    """
+    urls = []
+    if isinstance(data, list):
+        urls = data
+    elif isinstance(data, dict):
+        urls = data.get("urls", []) or []
+    entries = {}
+    for u in urls:
+        if not isinstance(u, str):
+            continue
+        k = _history_key(u)
+        if k:
+            entries[k] = {"first_seen": now, "last_seen": now}
+    return entries
+
+
+def load_sent_history(path=HISTORY_FILE, ttl_days=DISCOVERY_DEDUP_TTL_DAYS):
+    """读取 TTL 感知的去重缓存，返回 {key: {"first_seen": ts, "last_seen": ts}}。
+
+    处理策略：
+    * 文件缺失 / 损坏 / 非法 JSON -> 返回空 dict（绝不崩溃）。
+    * 新版格式 {"version": 2, "entries": {...}} -> 解析并容错非法 entry。
+    * 旧版格式 list / {"urls": [...]} -> 迁移为 entry dict（last_seen=读取时刻）。
+    * 加载后即时裁剪过期 entry，使内存中的缓存只含存活记录。
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError, ValueError, OSError):
-        return set()
-    if isinstance(data, list):
-        return set(data)
-    if isinstance(data, dict):
-        return set(data.get("urls", []))
-    return set()
+        return {}
+    if isinstance(data, dict) and "entries" in data:
+        entries = {}
+        for k, v in data["entries"].items():
+            if not isinstance(v, dict) or "last_seen" not in v:
+                continue  # 非法 entry -> 忽略
+            try:
+                fs = float(v.get("first_seen", v["last_seen"]))
+                ls = float(v["last_seen"])
+            except (TypeError, ValueError):
+                continue
+            entries[k] = {"first_seen": fs, "last_seen": ls}
+        return prune_expired_entries(entries, ttl_days)
+    # 旧版格式
+    return _migrate_legacy(data, _now_ts())
 
 
-def save_sent_history(urls, path=HISTORY_FILE, max_len=HISTORY_MAX):
-    """将本次新推送的 URL 合并写入缓存；超出上限时仅保留最近 max_len 条。"""
-    urls = [u for u in urls if u]
+def save_sent_history(urls, path=HISTORY_FILE, max_len=HISTORY_MAX,
+                      ttl_days=DISCOVERY_DEDUP_TTL_DAYS, now=None):
+    """将本次成功推送的 URL 合并写入 TTL 感知缓存。
+
+    * 新键：first_seen = now；已存在键：仅刷新 last_seen = now（保留首次发现时间）。
+    * 写入前再次裁剪过期 entry + 受 HISTORY_MAX 上限约束（按 last_seen 最旧优先淘汰）。
+    * 落盘格式：{"version": 2, "ttl_days": ..., "entries": {...}}。
+    * 旧 list 格式在首次写入后自然升级为新格式，不丢失、不清空历史。
+    """
+    now = now if now is not None else _now_ts()
+    urls = [_history_key(u) for u in urls if u]
     if not urls:
         return
-    existing = load_sent_history(path)
-    existing.update(urls)
-    if len(existing) > max_len:
-        existing = set(list(existing)[-max_len:])
+    entries = load_sent_history(path, ttl_days)  # 已裁剪为存活记录
+    for k in urls:
+        if k in entries:
+            entries[k]["last_seen"] = now
+        else:
+            entries[k] = {"first_seen": now, "last_seen": now}
+    # 防御性再裁剪过期项
+    entries = prune_expired_entries(entries, ttl_days, now)
+    # 尺寸保护：超出上限时保留 last_seen 最近的前 max_len 条
+    if len(entries) > max_len:
+        ordered = sorted(entries.items(), key=lambda kv: kv[1]["last_seen"])
+        entries = dict(ordered[-max_len:])
     try:
+        payload = {"version": 2, "ttl_days": ttl_days, "entries": entries}
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(sorted(existing), f, ensure_ascii=False, indent=2)
+            json.dump(payload, f, ensure_ascii=False, indent=2)
     except OSError as e:
         print(f"[history] 写入缓存失败：{e}", file=sys.stderr)
 
 
-def dedupe_leads(leads, history):
-    """过滤掉历史已推送过的线索；无 URL 的线索不做去重（始终视为新）。"""
+def dedupe_leads(leads, history, ttl_days=DISCOVERY_DEDUP_TTL_DAYS, now=None):
+    """过滤掉去重缓存中仍存活（未过期）的线索；无 URL 的线索不做去重。
+
+    `history` 接受两种形态（向后兼容）：
+    * TTL 感知 dict（推荐）：先裁剪过期 entry 再判定，过期键允许重新进入。
+    * 旧版 set / list：无时间戳，全部视为存活（维持原行为）。
+    """
+    now = now if now is not None else _now_ts()
+    if isinstance(history, dict):
+        live = prune_expired_entries(history, ttl_days, now)
+        live_keys = set(live.keys())
+    else:
+        live_keys = set(history)  # 旧版 set/list -> 全部存活
     kept, dropped = [], 0
     for l in leads:
-        url = l.get("source_url")
-        if url and url in history:
+        key = _history_key(l.get("source_url"))
+        if key and key in live_keys:
             dropped += 1
             continue
         kept.append(l)

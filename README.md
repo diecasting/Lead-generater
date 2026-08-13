@@ -40,7 +40,7 @@ GitHub Actions (每天 UTC 00:00 / 北京 08:00)
 ├── main.py                      # 核心执行脚本
 ├── requirements.txt             # Python 依赖
 ├── tests/                       # pytest 单元测试（配置校验 / 规则清洗 / 容灾 / 邮箱提取 / 去重）
-├── sent_cache.json              # 已推送线索缓存（自动生成，已 gitignore，CI 中通过 cache 持久化）
+├── sent_cache.json              # 已推送线索缓存（自动生成，已 gitignore，CI 中通过 cache 持久化；TTL 生命周期去重，格式为 {"version":2,"ttl_days":30,"entries":{...}}）
 └── README.md                    # 本说明
 ```
 
@@ -115,7 +115,8 @@ python main.py
 | `OPENAI_BASE_URL` | 空（官方） | 兼容端点地址（Azure / OpenRouter / 本地 vLLM 等） |
 | `OPENAI_MODEL` | `gpt-4o-mini` | 使用的模型名 |
 | `HISTORY_FILE` | `sent_cache.json` | 已推送线索历史缓存文件路径 |
-| `HISTORY_MAX` | `2000` | 历史缓存保留的最大条目数（超出后从最早开始淘汰） |
+| `HISTORY_MAX` | `2000` | 历史缓存保留的最大条目数（超出后按最近 `last_seen` 淘汰最旧条目） |
+| `DISCOVERY_DEDUP_TTL_DAYS` | `30` | 去重 TTL（天）。同一线索在 TTL 天内重复出现则去重；超过 TTL 允许重新进入 discovery pipeline（生命周期去重，替代原永久去重） |
 | `DIRECTORY_SEARCH` | `1` | 是否开启垂直黄页 / 专业社区定向搜索（`site:` 限制）。`0` 关闭，仅做普通全网搜索 |
 | `DIRECTORY_SITES` | `thomasnet.com,kompass.com,reddit.com/r/manufacturing,engineering.com,globalspec.com` | 定向搜索的站点白名单（逗号分隔）。系统会把关键词与这些站点轮询配对，生成 `关键词 site:站点` 查询，精准捕获黄页 / 社区的高价值线索 |
 | `DIRECTORY_MAX_QUERIES` | `12` | 定向搜索（site:）生成的最大查询数量，用于控制额外请求量 |

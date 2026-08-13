@@ -37,12 +37,15 @@ def test_history_roundtrip(tmp_path):
     p = str(tmp_path / "sent_cache.json")
     main.save_sent_history(["http://x.com/1", "http://x.com/2"], path=p)
     loaded = main.load_sent_history(path=p)
-    assert loaded == {"http://x.com/1", "http://x.com/2"}
+    # A1：缓存为 TTL 感知 dict {key: {first_seen, last_seen}}
+    assert set(loaded.keys()) == {"http://x.com/1", "http://x.com/2"}
+    for v in loaded.values():
+        assert "first_seen" in v and "last_seen" in v
 
 
 def test_load_history_missing_returns_empty(tmp_path):
     loaded = main.load_sent_history(path=str(tmp_path / "nope.json"))
-    assert loaded == set()
+    assert loaded == {}
 
 
 def test_build_html_has_intent_and_link():
