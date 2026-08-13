@@ -57,6 +57,8 @@ from lead_filter_engine import (
     RFQ_PLATFORM_RE,
     is_competitor,
     is_competitor_email,
+    passes_buyer_gate,
+    classify_company,
     filter_competitors,
     filter_competitor_emails,
 )
@@ -1187,6 +1189,106 @@ def send_email(subject, html):
 
 
 # ---------------------------------------------------------------------------
+# B4 — 供应商目录 Listing 过滤（针对 site: 定向查询到的黄页 / 社区）
+# ---------------------------------------------------------------------------
+def _domain_of(url):
+    """从 URL 中提取主机名（小写）。"""
+    m = re.search(r"https?://([^/]+)/?", url or "")
+    return (m.group(1).lower() if m else "")
+
+
+def is_directory_listing_lead(url, title, snippet):
+    """判断一条目录站结果是否是「纯供应商 Listing、无买方意图」。
+
+    规则（B4）：仅当来源域名属于 DIRECTORY_SITES（Thomasnet / Kompass /
+    GlobalSpec / Engineering 等）**且**文本缺乏真实买方意图时，才判定为
+    纯目录 Listing 并剔除。若目录页面带有 RFQ / 寻源 / 采购信号，则放行，
+    绝不对整个域名一刀切（避免误杀目录里的真实 Buyer / RFQ 贴）。
+
+    注意：此函数只针对目录站做「listing 级」额外过滤；同行自广告与普通
+    供应商仍由 is_competitor 处理，买方意图仍由 passes_buyer_gate 把关。
+
+    Args:
+        url (str):    结果 URL。
+        title (str):  结果标题。
+        snippet (str):结果摘要。
+
+    Returns:
+        bool: True 表示「目录站纯 Listing、无买方意图」，应剔除。
+    """
+    dom = _domain_of(url)
+    if not any(d in dom for d in DIRECTORY_SITES):
+        return False
+    text = f"{title} {snippet}".lower()
+    # 目录站 + 无买方意图 -> 视为纯供应商目录页（Supplier profile / Product listing）
+    return not passes_buyer_gate(text)
+
+
+def filter_directory_listings(raw_results):
+    """过滤掉目录站上「无买方意图」的纯 Listing 结果，仅保留带采购信号的页面。"""
+    kept, dropped = [], 0
+    for r in raw_results:
+        if is_directory_listing_lead(r.get("url", ""), r.get("title", ""),
+                                     r.get("snippet", "")):
+            dropped += 1
+            continue
+        kept.append(r)
+    if dropped:
+        print(f"[filter] 已过滤 {dropped} 条目录站纯 Listing（无买方意图）。",
+              file=sys.stderr)
+    return kept
+
+
+# ---------------------------------------------------------------------------
+# B2 — AI 清洗后强制再跑确定性闸门（LLM 分类只是建议，闸门才是权威）
+# ---------------------------------------------------------------------------
+def _lead_text_blob(lead):
+    """拼接一条线索用于确定性判定的文本（用于 AI 返回后的再校验）。"""
+    return " ".join(filter(None, [
+        lead.get("need_summary", ""),
+        lead.get("keyword", ""),
+        lead.get("source_url", ""),
+        lead.get("company", ""),
+    ])).lower()
+
+
+def apply_post_ai_gates(leads):
+    """clean_with_ai() 返回后强制再执行确定性闸门（B2 最高优先级）：
+
+    1. filter_competitors  —— 同行 / 供应商自广告硬过滤（AI 误判为 buyer 也拦得住）；
+    2. passes_buyer_gate   —— 买方意图闸门（缺买方动作则剔除）；
+    3. classify_company    —— 附加 7 类公司角色标签（仅辅助，不改变入库判定）。
+
+    核心原则：**AI 不能绕过 competitor gate，也不能绕过 buyer gate。** 即使 AI
+    标注为 BUYER，仍必须再次通过两道确定性闸门才能进入最终日报。
+
+    Returns:
+        (kept, comp_drop, buyer_drop): 通过闸门的线索 + 两道闸门各自剔除数。
+    """
+    kept, comp_drop, buyer_drop = [], 0, 0
+    for l in leads:
+        # 同行闸门：只用线索「实际内容」（need_summary + url）判定，
+        # 不把搜索关键词 keyword 计入——keyword 本质是买方意图查询
+        # （如 "seeking CNC machining supplier"），若计入会把真买家误判为同行。
+        if is_competitor(l.get("source_url", ""), l.get("need_summary", ""), ""):
+            comp_drop += 1
+            continue
+        # 买方闸门：用拼接文本复查
+        if not passes_buyer_gate(_lead_text_blob(l)):
+            buyer_drop += 1
+            continue
+        l["_company_class"] = classify_company(l)
+        kept.append(l)
+    if comp_drop:
+        print(f"[post-ai] 已剔除 {comp_drop} 条 AI 误判的同行/供应商线索。",
+              file=sys.stderr)
+    if buyer_drop:
+        print(f"[post-ai] 已剔除 {buyer_drop} 条 AI 误判但缺买方意图的线索。",
+              file=sys.stderr)
+    return kept, comp_drop, buyer_drop
+
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -1210,11 +1312,19 @@ def main():
     raw = filter_blacklist(raw)
     # 同行过滤：剔除压铸/加工/注塑等同行业工厂的自广告页面（竞争对手，非买家）
     raw = filter_competitors(raw)
+    # B4：目录站纯 Listing 过滤（site: 定向查询命中的黄页/社区，无买方意图即剔除）
+    raw = filter_directory_listings(raw)
     print(f"==> 过滤后剩余 {len(raw)} 条待清洗原始结果。")
 
     print("==> 调用 AI 清洗与过滤 ...")
     leads = clean_with_ai(raw)
-    print(f"==> 过滤后剩余 {len(leads)} 条合格线索。")
+    print(f"==> AI 清洗后剩余 {len(leads)} 条线索。")
+
+    # B2：AI 分类只是建议，确定性闸门仍是权威。clean_with_ai 返回后必须再次执行
+    # 同行闸门 + 买方闸门，AI 无法绕过任何一道确定性 gate。
+    leads, comp_drop, buyer_drop = apply_post_ai_gates(leads)
+    print(f"==> 后闸门过滤：剔除同行 {comp_drop} 条、缺买方意图 {buyer_drop} 条；"
+          f"剩余 {len(leads)} 条合格线索。")
 
     # 历史去重：仅推送未发送过的新线索
     history = load_sent_history()

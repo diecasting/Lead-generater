@@ -161,6 +161,21 @@ COMPETITOR_REGEX = re.compile(
     re.I,
 )
 
+# B1 新增：通用「供应商身份」标题/短语识别（组合语义，非单词匹配）
+# 形式：工艺词（die casting / casting / machining / cnc / molding ...）+ 供应商角色名词
+# （supplier / manufacturer / services / provider / foundry ...）。刻意杜绝单一词误判
+# （buyer 页面里也常出现 manufacturer / factory / production），只认「工艺 + 角色」组合。
+COMPETITOR_TITLE_RE = re.compile(
+    r"\b(?:alumin(?:ium|um)|zinc|magnesium|metal|die[- ]?cast|diecast|"
+    r"casting|injection[- ]?mold(?:ing)?|cnc|precision|machin|mold(?:ing)?|"
+    r"stamping|fabricat|forg|tool)"
+    r"(?:[- ])?"
+    r"(?:casting|machining|molding|moulding|stamping)?"  # 可选中间工艺词
+    r"\s+(?:supplier|manufacturer|services|producer|provider|maker|"
+    r"company|foundry|workshop|factory|facility)\b",
+    re.I,
+)
+
 
 def is_competitor(url="", title="", snippet=""):
     """判定一条结果是否属于同行供应商自广告（而非真实买家）。
@@ -183,9 +198,17 @@ def is_competitor(url="", title="", snippet=""):
         True
     """
     text = f"{title} {snippet} {url}".lower()
+    # 1) 既有硬短语 / 自广告正则（保留原有全部规则，不删除）
     if any(p in text for p in COMPETITOR_HARD_PHRASES):
         return True
     if COMPETITOR_REGEX.search(text):
+        return True
+    # 2) B1 新增：通用「工艺 + 供应商角色」组合短语（如 Die Casting Supplier、
+    #    Aluminum Die Casting Services、CNC Machining Manufacturer）。命中即视为
+    #    同行 / 供应商自广告——除非同一文本明显表达「真实买方意图」（TRUE_BUYER_RE，
+    #    与买方闸门一致），此时它是询盘而非供应商自广告，放行交由买方闸门进一步判定。
+    #    这样可避免误杀买家页面（如 "Buyer seeking CNC machining supplier, RFQ ..."）。
+    if COMPETITOR_TITLE_RE.search(text) and not TRUE_BUYER_RE.search(text):
         return True
     return False
 
@@ -288,6 +311,86 @@ def passes_buyer_gate(text):
     确保只放行真正由买家发出的求购动作。
     """
     return is_true_buyer(text)
+
+
+# ===========================================================================
+# 四之二、7 类公司角色分类（与 is_competitor / is_true_buyer 解耦的辅助标签）
+# ===========================================================================
+# 在确定性闸门之外，额外给每条线索打一个「公司角色」标签，便于下游（报表 / CRM）
+# 做分群，而不会影响现有的 competitor / buyer 布尔判定。判定优先级自上而下：
+#   COMPETITOR > DISTRIBUTOR > SERVICE_PROVIDER > SUPPLIER > OEM > BUYER > IRRELEVANT
+# 关键约束：不删除、不替换 is_competitor / is_true_buyer，仅新增一个独立维度；
+# 也不要把 manufacturer 简单等同于 COMPETITOR（manufacturer 未触及同行硬规则时归
+# SUPPLIER），也不要把 OEM 简单等同于 BUYER（OEM 仅在同时表达采购意图时才归 OEM）。
+
+COMPANY_CLASSES = (
+    "BUYER", "SUPPLIER", "COMPETITOR", "OEM", "DISTRIBUTOR",
+    "SERVICE_PROVIDER", "IRRELEVANT",
+)
+
+_DISTRIBUTOR_RE = re.compile(
+    r"\b(?:distribut|reseller|wholesal|stockist|dealer|trader)", re.I)
+_SERVICE_PROVIDER_RE = re.compile(
+    r"service provider|engineering services|\bconsult|"
+    r"prototyp(?:ing)? service|3d print(?:ing)? service|design service|"
+    r"sourcing (?:agent|service)|trading company|import(?:ing|er)? company|"
+    r"\bagent\b|\bbroker\b", re.I)
+_SUPPLIER_RE = re.compile(
+    r"we (?:manufacture|produce|supply|fabricate|make|provide)|"
+    r"our (?:products|parts|components)|"
+    r"(?:oem|odm) (?:manufacturer|supplier|factory)|"
+    r"supplier of|manufacturer of|factory of|exporter of", re.I)
+
+
+def classify_company(lead):
+    """给一条线索打上 7 类公司角色标签（与 is_competitor / is_true_buyer 解耦）。
+
+    仅做「辅助分类」，不改变任何过滤 / 评分逻辑；真正决定入库与否的仍是
+    is_competitor 与 passes_buyer_gate。返回值为 COMPANY_CLASSES 之一。
+
+    Args:
+        lead (dict): 含 'need_summary' / 'keyword' / 'source_url' / 'company' 之一。
+
+    Returns:
+        str: 公司角色标签。
+
+    示例：
+        >>> classify_company({"need_summary": "We are looking for a die casting supplier",
+        ...                   "keyword": "looking for die casting supplier"})
+        'BUYER'
+    """
+    blob = " ".join(filter(None, [
+        lead.get("need_summary", ""),
+        lead.get("keyword", ""),
+        lead.get("source_url", ""),
+        lead.get("company", ""),
+    ])).lower()
+    return _classify_text(blob)
+
+
+def _classify_text(text):
+    """基于确定证据的 7 类分类（见 classify_company 的优先级说明）。"""
+    t = (text or "").lower()
+    # 1) 同行 / 供应商自广告（复用既有硬规则）
+    if is_competitor("", t, t):
+        return "COMPETITOR"
+    # 2) 经销商 / 分销商
+    if _DISTRIBUTOR_RE.search(t):
+        return "DISTRIBUTOR"
+    # 3) 服务方（设计 / 工程 /  sourcing agent / 贸易，非制造）
+    if _SERVICE_PROVIDER_RE.search(t):
+        return "SERVICE_PROVIDER"
+    # 4) 供应商（制造 / 供货能力，但未触及同行硬规则）
+    if _SUPPLIER_RE.search(t):
+        return "SUPPLIER"
+    # 5) OEM（既提 OEM/ODM 又表达采购意图）
+    if re.search(r"\boem\b|\bodm\b", t) and is_true_buyer(t):
+        return "OEM"
+    # 6) 真实买方
+    if is_true_buyer(t):
+        return "BUYER"
+    # 7) 其它（新闻 / 教程 / 无关）
+    return "IRRELEVANT"
 
 
 # ===========================================================================
