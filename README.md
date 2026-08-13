@@ -118,6 +118,7 @@ python main.py
 | `HISTORY_MAX` | `2000` | 历史缓存保留的最大条目数（超出后按最近 `last_seen` 淘汰最旧条目） |
 | `DISCOVERY_DEDUP_TTL_DAYS` | `30` | 去重 TTL（天）。同一线索在 TTL 天内重复出现则去重；超过 TTL 允许重新进入 discovery pipeline（生命周期去重，替代原永久去重） |
 | `DISCOVERY_SEARCH_FRESHNESS` | `Week` | Bing 搜索时间窗（freshness）。允许值：`Day` / `Week` / `Month`。**仅作用于配置了 `BING_API_KEY` 的 Bing 搜索路径**；DDG 回退路径不支持 freshness 参数，配置对其无效。非法值会打印警告并回退到 `Week`，discovery 不会崩溃 |
+| `DISCOVERY_DRY_RUN` | `false` | 安全实验开关。**默认关闭，生产行为完全不变**。设为 `true` / `1` / `yes` / `on` 时：真实执行 search / filter / AI / enrichment，照常生成 `leads_report.json` / `.html`，额外写入 `discovery_metrics.json`（funnel 漏斗指标），但**完全跳过 `send_email()` 与 `save_sent_history()`**——不连接 SMTP、不写入 `sent_cache`。用于在不发送邮件、不污染历史缓存的前提下做 Week vs Month 等真实 A/B 实验。**不影响任何 Discovery 策略**（搜索量 / 阈值 / score / 关键词 / freshness 默认值等均不变） |
 | `DIRECTORY_SEARCH` | `1` | 是否开启垂直黄页 / 专业社区定向搜索（`site:` 限制）。`0` 关闭，仅做普通全网搜索 |
 | `DIRECTORY_SITES` | `thomasnet.com,kompass.com,reddit.com/r/manufacturing,engineering.com,globalspec.com` | 定向搜索的站点白名单（逗号分隔）。系统会把关键词与这些站点轮询配对，生成 `关键词 site:站点` 查询，精准捕获黄页 / 社区的高价值线索 |
 | `DIRECTORY_MAX_QUERIES` | `12` | 定向搜索（site:）生成的最大查询数量，用于控制额外请求量 |

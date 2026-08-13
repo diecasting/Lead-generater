@@ -190,6 +190,15 @@ if DISCOVERY_SEARCH_FRESHNESS not in _ALLOWED_FRESHNESS:
     )
     DISCOVERY_SEARCH_FRESHNESS = "Week"
 
+# A2.2-1 — 安全实验开关（DRY-RUN）。默认 false，保持生产行为完全不变。
+# 设为 "true" / "1" / "yes" / "on" 时：真实执行 search / filter / AI / enrichment，
+# 生成 leads_report.json 与 discovery_metrics.json，但完全跳过 send_email()
+# 与 save_sent_history()，不连接 SMTP、不写入 sent_cache —— 使 Week vs Month
+# 可在不发送邮件、不污染历史缓存的情况下进行真实实验。此开关不影响任何
+# Discovery 策略（搜索量 / 阈值 / score / 关键词 / freshness 默认值等均不变）。
+_DISCOVERY_DRY_RUN_RAW = os.getenv("DISCOVERY_DRY_RUN", "false").strip().lower()
+DISCOVERY_DRY_RUN = _DISCOVERY_DRY_RUN_RAW in ("1", "true", "yes", "on")
+
 # 垂直黄页 / 专业社区定向搜索（site: 限制），可经环境变量覆盖
 DIRECTORY_SITES = [
     s.strip()
@@ -1430,29 +1439,43 @@ def main():
 
     print("==> 收集原始线索 ...")
     raw = collect_raw_leads()
-    print(f"==> 共收集到 {len(raw)} 条原始结果。")
+    raw_results = len(raw)
+    print(f"==> 共收集到 {raw_results} 条原始结果。")
 
     # 黑名单过滤：剔除知乎/维基/博客/中介广告等垃圾站点，只留真实买家
+    n0 = len(raw)
     raw = filter_blacklist(raw)
+    blacklist_rejected = n0 - len(raw)
     # 同行过滤：剔除压铸/加工/注塑等同行业工厂的自广告页面（竞争对手，非买家）
+    n0 = len(raw)
     raw = filter_competitors(raw)
+    competitor_raw_rejected = n0 - len(raw)
     # B4：目录站纯 Listing 过滤（site: 定向查询命中的黄页/社区，无买方意图即剔除）
+    n0 = len(raw)
     raw = filter_directory_listings(raw)
-    print(f"==> 过滤后剩余 {len(raw)} 条待清洗原始结果。")
+    directory_rejected = n0 - len(raw)
+    unique_candidates = len(raw)
+    print(f"==> 过滤后剩余 {unique_candidates} 条待清洗原始结果。")
 
     print("==> 调用 AI 清洗与过滤 ...")
+    n0 = len(raw)
     leads = clean_with_ai(raw)
+    ai_rejected = n0 - len(leads)
     print(f"==> AI 清洗后剩余 {len(leads)} 条线索。")
 
     # B2：AI 分类只是建议，确定性闸门仍是权威。clean_with_ai 返回后必须再次执行
     # 同行闸门 + 买方闸门，AI 无法绕过任何一道确定性 gate。
     leads, comp_drop, buyer_drop = apply_post_ai_gates(leads)
+    competitor_post_ai_rejected = comp_drop
+    buyer_gate_rejected = buyer_drop
     print(f"==> 后闸门过滤：剔除同行 {comp_drop} 条、缺买方意图 {buyer_drop} 条；"
           f"剩余 {len(leads)} 条合格线索。")
 
     # 历史去重：仅推送未发送过的新线索
+    n0 = len(leads)
     history = load_sent_history()
     leads = dedupe_leads(leads, history)
+    dedup_rejected = n0 - len(leads)
     print(f"==> 去重后剩余 {len(leads)} 条新线索待推送。")
 
     # 网页邮箱提取：为每条线索抓取并解析其来源页面中的联系邮箱
@@ -1480,16 +1503,46 @@ def main():
         json.dump({"generated_at": generated_at, "leads": leads},
                   f, ensure_ascii=False, indent=2)
 
-    subject = f"每日潜在客户线索日报 · {now.strftime('%Y-%m-%d')} · {len(leads)} 条新线索"
-    sent = send_email(subject, html)
-
-    # 推送成功后才将本次线索写入历史缓存，确保不重复推送
-    if sent:
-        save_sent_history([l.get("source_url") for l in leads])
-        print("==> 完成，历史缓存已更新。")
+    # A2.2-1 — 安全实验开关：dry-run 下完全跳过邮件发送与历史缓存写入，
+    # 不触碰 SMTP、不污染 sent_cache，但仍生成完整报告与 funnel 指标。
+    if DISCOVERY_DRY_RUN:
+        print("==> [dry-run] DISCOVERY_DRY_RUN=true：跳过邮件发送，"
+              "不写入历史缓存（sent_cache 保持不变）。", file=sys.stderr)
+        sent = False
     else:
-        print("==> 邮件发送未成功，本次线索不写入历史缓存（下次运行将重试）。",
-              file=sys.stderr)
+        subject = f"每日潜在客户线索日报 · {now.strftime('%Y-%m-%d')} · {len(leads)} 条新线索"
+        sent = send_email(subject, html)
+        # 推送成功后才将本次线索写入历史缓存，确保不重复推送
+        if sent:
+            save_sent_history([l.get("source_url") for l in leads])
+            print("==> 完成，历史缓存已更新。")
+        else:
+            print("==> 邮件发送未成功，本次线索不写入历史缓存（下次运行将重试）。",
+                  file=sys.stderr)
+
+    # A2.2-1 — Funnel 指标（每次运行都落盘，供 Week vs Month 安全实验对比）。
+    # 仅做计数汇总，不修改任何 Discovery 策略（score / 阈值 / 关键词等不变）。
+    metrics = {
+        "generated_at": generated_at,
+        "dry_run": DISCOVERY_DRY_RUN,
+        "freshness": DISCOVERY_SEARCH_FRESHNESS,
+        "funnel": {
+            "raw_results": raw_results,
+            "unique_candidates": unique_candidates,
+            "blacklist_rejected": blacklist_rejected,
+            "competitor_rejected": (
+                competitor_raw_rejected + competitor_post_ai_rejected),
+            "directory_rejected": directory_rejected,
+            "ai_rejected": ai_rejected,
+            "buyer_gate_rejected": buyer_gate_rejected,
+            "dedup_rejected": dedup_rejected,
+            "final_qualified": len(leads),
+            "emails_extracted": total_emails,
+            "sent": 1 if sent else 0,
+        },
+    }
+    with open("discovery_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
 
 
 if __name__ == "__main__":
