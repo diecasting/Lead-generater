@@ -4,6 +4,26 @@ on:
   schedule:
     - cron: '0 0 * * *'  # 每天 UTC 0点（北京时间早8点）运行
   workflow_dispatch:      # 允许手动触发
+    inputs:
+      dry_run:
+        description: 'Dry-run mode: skip send_email() and save_sent_history()'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+        default: 'false'
+      freshness:
+        description: 'Bing search freshness window (Day/Week/Month; Bing path only)'
+        type: choice
+        options:
+          - 'Day'
+          - 'Week'
+          - 'Month'
+        default: 'Week'
+      history_file:
+        description: 'Dedup history file path; override to isolate experiments from sent_cache.json'
+        type: string
+        default: 'sent_cache.json'
 
 jobs:
   collect-leads:
@@ -45,6 +65,10 @@ jobs:
           key: sent-history-cache-v1
 
       - name: Run lead collector
+        env:
+          DISCOVERY_DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          DISCOVERY_SEARCH_FRESHNESS: ${{ inputs.freshness || 'Week' }}
+          HISTORY_FILE: ${{ inputs.history_file || 'sent_cache.json' }}
         run: python main.py
 
       - name: Upload report artifact
