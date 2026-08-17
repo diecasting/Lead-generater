@@ -120,23 +120,23 @@ COMPETITOR_HARD_PHRASES = (
     "we are a foundry", "we're a manufacturer", "we are a precision",
     "our foundry", "our factory", "our own factory",
     "our manufacturing facility", "our production facility",
-    "casting capabilities", "machining services provider",
+    "machining services provider",
     "injection molding supplier", "iso certified factory",
-    "iso certified manufacturer", "custom manufacturing solutions",
+    "iso certified manufacturer",
     "we provide manufacturing services", "we specialize in manufacturing",
     "precision manufacturer since", "leading manufacturer of",
     "leading supplier of", "leading foundry", "one-stop manufacturing",
     "turnkey manufacturing", "we offer die casting",
     "we offer cnc machining", "we offer injection molding",
-    "our capabilities include", "welcome to our factory",
+    "welcome to our factory",
     # 供应商在「邀请别人向自己询价」（区别于买家主动询盘）
     "request a quote from us", "request quote from us",
     "get a quote from us", "contact us for a quote", "ask us for a quote",
     "request for quote from us",
-    # 供应商自述特征（"我们生产 / 我们提供服务" 逻辑）
-    "we manufacture", "we fabricate", "we produce", "our capabilities",
-    "iso certified", "iso 9001", "iso9001", "our production line",
-    "we are equipped with", "our equipment includes",
+    # 供应商自述特征（"我们生产 / 我们提供服务" 逻辑）—— 仅保留显式第一人称制造动词，
+    # 已移除 casting capabilities / custom manufacturing solutions / iso certified /
+    # our capabilities / our production line 等泛化制造词汇（见 A2.2-5，避免误杀中立页面）
+    "we manufacture", "we fabricate", "we produce",
 )
 
 # 高精度的「自广告主语 + 供应商名词」正则：必须出现 we/our + 供应商名词，
@@ -198,16 +198,20 @@ def is_competitor(url="", title="", snippet=""):
         True
     """
     text = f"{title} {snippet} {url}".lower()
-    # 1) 既有硬短语 / 自广告正则（保留原有全部规则，不删除）
+    # 0) 买方意图优先（A2.2-5）：若文本明确表达真实买方意图（TRUE_BUYER_RE 命中），
+    #    一律视为求购 / 外包页面，不误判为同行——即便其夹带部分制造词汇。这是
+    #    「买方意图明显的页面优先保留」的核心保障，可杜绝把真实买家当同行误杀。
+    if TRUE_BUYER_RE.search(text):
+        return False
+    # 1) 既有硬短语 / 自广告正则（仅保留「明确自称 Manufacturer/Factory/Foundry
+    #    或主动反向邀约」的强信号；泛化制造词汇已移除以避免误杀中立页面）
     if any(p in text for p in COMPETITOR_HARD_PHRASES):
         return True
     if COMPETITOR_REGEX.search(text):
         return True
-    # 2) B1 新增：通用「工艺 + 供应商角色」组合短语（如 Die Casting Supplier、
+    # 2) B1 通用「工艺 + 供应商角色」组合短语（如 Die Casting Supplier、
     #    Aluminum Die Casting Services、CNC Machining Manufacturer）。命中即视为
-    #    同行 / 供应商自广告——除非同一文本明显表达「真实买方意图」（TRUE_BUYER_RE，
-    #    与买方闸门一致），此时它是询盘而非供应商自广告，放行交由买方闸门进一步判定。
-    #    这样可避免误杀买家页面（如 "Buyer seeking CNC machining supplier, RFQ ..."）。
+    #    同行 / 供应商自广告——除非同一文本明显表达「真实买方意图」，放行交由买方闸门。
     if COMPETITOR_TITLE_RE.search(text) and not TRUE_BUYER_RE.search(text):
         return True
     return False
@@ -244,8 +248,9 @@ def filter_competitors(raw_results):
 
 TRUE_BUYER_RE = re.compile(
     r"we (?:are|'re) looking for|"                                       # we are looking for
-    r"looking for (?:a |an |our |the )?(?:supplier|manufacturer|quote|partner|"
-    r"vendor|factory|oem|odm|foundry|molder)\b|"                          # looking for a supplier
+    r"looking for (?:a |an |our |the )?(?:supplier|manufacturer|quote|quotation|"
+    r"price|pricing|partner|"
+    r"vendor|factory|oem|odm|foundry|molder)\b|"                          # looking for a supplier / quotation / pricing
     r"seeking (?:a |an |our |the )?(?:supplier|manufacturer|quote|partner|"
     r"vendor|oem|odm|foundry)\b|"                                         # seeking a supplier
     r"our (?:company|team|project|firm|organization) (?:needs|requires|"
@@ -255,6 +260,10 @@ TRUE_BUYER_RE = re.compile(
     r"need to (?:source|outsource|procure|order|purchase|buy|find|get)|"  # we need to outsource
     r"request(?:ing)? (?:a |for )?(?:quote|quotation)(?! from)|"        # requesting a quote（排除 "from us" 反向邀约）
     r"request for (?:quote|quotation)|"                                   # request for quote
+    r"need (?:a |the )?pricing for|"                                       # need pricing for
+    r"sourcing (?:parts|components|suppliers|manufacturers|partners)\b|"   # sourcing parts
+    r"manufacturing partner needed|"                                       # manufacturing partner needed
+    r"supplier(?:s)? required|"                                            # supplier required
     r"help (?:us|me) (?:find|source|get|obtain) (?:a |an )?"
     r"(?:supplier|quote|manufacturer|partner)|"                           # help us find a supplier
     r"looking to (?:source|outsource|procure|partner|buy|order|find)|"    # looking to source
@@ -264,14 +273,33 @@ TRUE_BUYER_RE = re.compile(
     r"in need of|sourcing (?:for|a |the )|"                               # in need of / sourcing for
     r"procurement|tender|bid (?:for|request)|"                            # procurement / tender
     r"buy (?:from|the|these)|purchase (?:from|order)|"                    # buy from
-    r"quote request|quotation request",                                   # quote / rfq
+    r"quote request|quotation request"                                    # quote / rfq
+    # —— A2.2-5 包容性增强：海外采购商常见询价 / 寻源表达（动词化、精准，避免误伤同行）——
+    r"please (?:send|provide|share|quote|give) (?:us )?(?:a |your )?"
+    r"(?:quote|quotation|price|pricing|proposal)|"                         # please send us a quote
+    r"send (?:us )?(?:a |your )?(?:quote|quotation|price|pricing)|"        # send your quotation
+    r"quote (?:needed|required|requested|please)|"                         # quote needed
+    r"price (?:inquiry|enquiry|request|list)|"                             # price inquiry
+    r"best price for|"                                                     # best price for
+    r"we are in the market for|"                                           # we are in the market for
+    r"we require (?:a |an |the )?(?:die[- ]?cast(?:ing)? |alumin\w* |zinc |"
+    r"metal |cnc |precision |custom |our )?(?:supplier|manufacturer|quote|"
+    r"partner|foundry|oem|odm)|"                                           # we require a supplier
+    r"(?:supplier|manufacturer|foundry|factory|molder|oem|odm|partner|"
+    r"vendor)s? (?:needed|required|wanted)|"                                # supplier needed（买家求供，非同行自广告）
+    r"looking to buy|want to buy|wish to buy|interested in buying|"        # 明确购买意图
+    r"need to (?:place|make) (?:an |a )?order|ready to order|"             # 准备下单
+    r"\bimport (?:from )?(?:china|overseas)|"                              # 海外采购信号
+    r"sourcing (?:from|in) china|china (?:sourcing|procurement)|"
+    r"overseas supplier|global supplier|worldwide supplier|"
+    r"find (?:a |an )?(?:china|overseas) (?:supplier|manufacturer)",
     re.I,
 )
 # 采购平台 / 黄页上的真实求购贴信号：RFQ 标识、图纸 / 规格需求（非制造企业发出的
 # 组装 / 设计需求）。用于放行那些没有显式买方动词、但确实是求购贴的结果。
 RFQ_PLATFORM_RE = re.compile(
     r"\brfq\b|request for quote|request for quotation|quotation request|"
-    r"quote request|rfq[#\s\-]?\d|"
+    r"quote request|rfq[#\s\-]?\d|enquiry|inquiry|price request|bid request|"
     r"(?:drawing|cad|step|iges|dxf|\bstp\b|blueprint|3d model|technical spec)\b",
     re.I,
 )
@@ -311,6 +339,64 @@ def passes_buyer_gate(text):
     确保只放行真正由买家发出的求购动作。
     """
     return is_true_buyer(text)
+
+
+# ===========================================================================
+# 三之二、B 类 / 待观察线索兜底（防每日 0 条）
+# ===========================================================================
+# 当严格过滤（同行闸门 + 买方闸门）后确实为 0 条时，从被买方闸门剔除的候选里
+# 回收「中 / 低意向但带有强 RFQ / 寻源信号」的页面，归为 B 类（待观察）线索，
+# 避免日报完全空白。这类页面不具备显式买方动词，但同时含「弱意向词 + 制造 / 零件
+# 词」组合，仍可能是真实外包 / 采购需求，值得人工二次确认。
+WATCH_INTENT_RE = re.compile(
+    r"\b(looking for|need|needs|needed|require|requires|required|"
+    r"sourcing|partner needed|quotation|rfq|request quote|request a quote|"
+    r"prototype|prototyping|custom|oem|odm|outsource|outsourcing|project|"
+    r"want|want to|seek|seeking|buy|buying|purchase|purchasing|order|ordering|enquiry|inquiry|import|overseas)\b",
+    re.I,
+)
+WATCH_DOMAIN_RE = re.compile(
+    r"\b(alumin|zinc|magnes|metal|die ?cast|casting|injection ?mold|"
+    r"cnc|machin|mold|stamp|fabricat|forg|tool|part|component|"
+    r"supplier|manufactur|precision|hardware|enclosure|housing|bracket)\b",
+    re.I,
+)
+
+
+def has_watch_signal(text):
+    """判断文本是否含「弱意向词 + 制造 / 零件词」组合（B 类待观察线索信号）。"""
+    return bool(WATCH_INTENT_RE.search(text) and WATCH_DOMAIN_RE.search(text))
+
+
+def recover_watch_leads(candidates):
+    """兜底：从严格过滤落选的候选中回收 B 类（待观察）线索。
+
+    仅回收满足以下全部条件的候选：
+    1. 不是明确同行自广告（通过 is_competitor 复检）；
+    2. 未通过严格买方闸门（passes_buyer_gate 为 False）；
+    3. 含弱意向 + 制造 / 零件组合信号（has_watch_signal 为 True）。
+
+    返回的每条线索带 ``_watch=True`` 标记，便于下游降权 / 标注。
+
+    Args:
+        candidates (list[dict]): clean_with_ai 之后的候选线索（含 need_summary /
+            keyword / source_url 等字段）。
+
+    Returns:
+        list[dict]: 回收的 B 类待观察线索（已打 _watch 标记）。
+    """
+    watch = []
+    for l in candidates:
+        url = l.get("source_url", "")
+        summary = l.get("need_summary", "")
+        if is_competitor(url, summary, ""):
+            continue
+        blob = " ".join(filter(None, [summary, l.get("keyword", ""), url])).lower()
+        if not passes_buyer_gate(blob) and has_watch_signal(blob):
+            item = dict(l)
+            item["_watch"] = True
+            watch.append(item)
+    return watch
 
 
 # ===========================================================================

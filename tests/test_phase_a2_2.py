@@ -218,5 +218,5 @@ def test_metrics_emitted_in_dry_run_and_production(monkeypatch, tmp_path):
             "raw_results", "unique_candidates", "blacklist_rejected",
             "competitor_rejected", "directory_rejected", "ai_rejected",
             "buyer_gate_rejected", "dedup_rejected", "final_qualified",
-            "emails_extracted", "sent",
+            "emails_extracted", "sent", "watch_recovered",
         }

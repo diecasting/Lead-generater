@@ -61,6 +61,7 @@ from lead_filter_engine import (
     classify_company,
     filter_competitors,
     filter_competitor_emails,
+    recover_watch_leads,
 )
 
 
@@ -1465,11 +1466,23 @@ def main():
 
     # B2：AI 分类只是建议，确定性闸门仍是权威。clean_with_ai 返回后必须再次执行
     # 同行闸门 + 买方闸门，AI 无法绕过任何一道确定性 gate。
+    candidates = leads
     leads, comp_drop, buyer_drop = apply_post_ai_gates(leads)
     competitor_post_ai_rejected = comp_drop
     buyer_gate_rejected = buyer_drop
     print(f"==> 后闸门过滤：剔除同行 {comp_drop} 条、缺买方意图 {buyer_drop} 条；"
           f"剩余 {len(leads)} 条合格线索。")
+
+    # A2.2-5 兜底策略：严格过滤后为 0 条时，从候选中回收 B 类（待观察）线索，
+    # 避免每日日报完全空白（中 / 低意向但含强 RFQ / 寻源信号的页面值得人工二次确认）。
+    n_strict = len(leads)
+    if n_strict == 0:
+        watch = recover_watch_leads(candidates)
+        for l in watch:
+            l["_watch"] = True
+        leads = watch
+        print(f"==> [兜底] 严格过滤为 0 条，回收 {len(watch)} 条 B 类（待观察）线索。")
+    watch_recovered = len(leads) - n_strict
 
     # 历史去重：仅推送未发送过的新线索
     n0 = len(leads)
@@ -1490,6 +1503,9 @@ def main():
         if (l.get("company") or "Unknown") in ("Unknown", "", None):
             l["company"] = extract_company_name("", l.get("source_url", ""))
         l["score"] = score_lead(l)
+        # A2.2-5：B 类（待观察）线索降权，避免与高意向 A 类混淆
+        if l.get("_watch"):
+            l["score"] = min(l["score"], 35)
         l["cold_email"] = generate_cold_email(l)
     leads.sort(key=lambda x: x.get("score", 0), reverse=True)
     print(f"==> 已为 {len(leads)} 条线索评分并生成开发信，按意向分排序完成。")
@@ -1537,6 +1553,7 @@ def main():
             "buyer_gate_rejected": buyer_gate_rejected,
             "dedup_rejected": dedup_rejected,
             "final_qualified": len(leads),
+            "watch_recovered": watch_recovered,
             "emails_extracted": total_emails,
             "sent": 1 if sent else 0,
         },
